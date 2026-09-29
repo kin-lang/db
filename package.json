@@ -1,0 +1,50 @@
+{
+  "name": "@kin-lang/db",
+  "version": "0.1.0",
+  "description": "In-memory relational database with Kinyarwanda SQL. Speaks .kindb scripts and page-structured .db files, and plugs into the Kin language.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "kindb": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest --no-watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "kin",
+    "kinyarwanda",
+    "database",
+    "json",
+    "sql",
+    "kindb"
+  ],
+  "author": "Kin contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kin-lang/db.git"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.3.3",
+    "vitest": "^4.0.0"
+  }
+}
