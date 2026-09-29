@@ -1,0 +1,15 @@
+# Huza — inner join of students and teachers.
+# kindb run examples/huza.kindb --db examples/huza.db
+
+kora itsinda abanyeshuri (id umubare, izina ijambo, mwarimu umubare)
+kora itsinda abigisha (id umubare, umwarimu ijambo)
+
+shira muri abanyeshuri { id: 1, izina: "Aline", mwarimu: 1 }
+shira muri abanyeshuri { id: 2, izina: "Keza", mwarimu: 2 }
+shira muri abigisha { id: 1, umwarimu: "Mukama" }
+shira muri abigisha { id: 2, umwarimu: "Kalisa" }
+
+hitamo a.izina, b.umwarimu
+muri abanyeshuri a
+huza abigisha b
+aho a.mwarimu = b.id

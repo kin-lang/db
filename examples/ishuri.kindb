@@ -1,0 +1,14 @@
+# Ishuri — demo script for `kindb run examples/ishuri.kindb --db examples/ishuri.db`
+# Statements are Kinyarwanda SQL. Semicolons are optional. # and -- start comments.
+
+kora itsinda abanyeshuri
+kora itsinda abigisha
+
+shira muri abanyeshuri { id: 1, izina: "Aline", amanota: 88, yize: nibyo }
+shira muri abanyeshuri (id, izina, amanota, yize) agaciro (2, "Keza", 41, sibyo)
+shira muri abigisha { id: 1, izina: "Mukama", umurimo: ubusa }
+
+hindura abanyeshuri shyira amanota = 70 aho id = 2
+
+hitamo izina, amanota muri abanyeshuri aho amanota >= 50
+hitamo * muri abigisha aho izina = "Mukama"
