@@ -58,7 +58,31 @@ export function assertCollectionName(name: string): void {
 }
 
 export function cloneJson<T extends JsonValue>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((item) => cloneJson(item)) as T;
+  const copy: { [key: string]: JsonValue } = {};
+  const record = value as { [key: string]: JsonValue };
+  for (const key of Object.keys(record)) copy[key] = cloneJson(record[key]);
+  return copy as T;
+}
+
+/**
+ * Bucket for a hash join. Values that are loose-equal share a bucket.
+ * A numeric string shares the bucket of its number, so callers must
+ * recheck with {@link looseEqual}: `"1"` and `"1.0"` collide but are not equal.
+ * Returns null when the value cannot match anything.
+ */
+export function looseBucket(value: JsonValue | undefined): string | null {
+  if (value === undefined) return null;
+  if (value === null) return 'null';
+  if (typeof value === 'boolean') return value ? 'b:1' : 'b:0';
+  if (typeof value === 'number') return `n:${value}`;
+  if (typeof value === 'string') {
+    const parsed = numericString(value);
+    if (Number.isFinite(parsed)) return `n:${parsed}`;
+    return `s:${value}`;
+  }
+  return `j:${JSON.stringify(value)}`;
 }
 
 export function assertJson(value: unknown, path = 'value'): asserts value is JsonValue {

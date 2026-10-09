@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { KinDbError } from './errors';
 import { executeSource, type ExecuteResult } from './execute';
@@ -96,7 +96,13 @@ export class Database {
 
   /** Write the `.db` file. Passing a path binds future saves to that file. */
   save(filePath?: string): void {
-    if (filePath) this.filePath = resolve(filePath);
+    if (filePath) {
+      const next = resolve(filePath);
+      const full = next !== this.filePath;
+      this.filePath = next;
+      this.store.writeTo(this.filePath, full);
+      return;
+    }
     if (!this.filePath) {
       throw new KinDbError('E_IO', 'save() needs a file path for a memory database');
     }
@@ -145,7 +151,7 @@ export class Database {
 
   private commit(): void {
     if (!this.filePath) return;
-    writeFileSync(this.filePath, this.store.toBytes());
+    this.store.writeTo(this.filePath, false);
   }
 }
 

@@ -22,10 +22,25 @@ export interface StoredRecord {
   overflow: number;
 }
 
+/**
+ * In-order scan of a table btree.
+ * `visit` returns false to stop. The walk does not read later pages.
+ */
+export function scanUntil(
+  pager: Pager,
+  root: number,
+  visit: (record: StoredRecord) => boolean,
+): void {
+  walkUntil(pager, root, visit);
+}
+
 /** In-order scan of a table btree. */
 export function scanTree(pager: Pager, root: number): StoredRecord[] {
   const found: StoredRecord[] = [];
-  walk(pager, root, found);
+  scanUntil(pager, root, (record) => {
+    found.push(record);
+    return true;
+  });
   return found;
 }
 
@@ -57,20 +72,31 @@ export function freeTree(pager: Pager, root: number): void {
   for (const page of pages) pager.free(page);
 }
 
-function walk(pager: Pager, pageNumber: number, into: StoredRecord[]): void {
+function walkUntil(
+  pager: Pager,
+  pageNumber: number,
+  visit: (record: StoredRecord) => boolean,
+): boolean {
   const page = pager.get(pageNumber);
   if (page.readUInt8(0) === PAGE_LEAF) {
     for (const cell of readLeaf(page)) {
-      into.push({ rowid: cell.rowid, payload: readPayload(pager, cell), overflow: cell.overflow });
+      const keepGoing = visit({
+        rowid: cell.rowid,
+        payload: readPayload(pager, cell),
+        overflow: cell.overflow,
+      });
+      if (!keepGoing) return false;
     }
-    return;
+    return true;
   }
   if (page.readUInt8(0) !== PAGE_INTERIOR) {
     throw new KinDbError('E_IO', `Page ${pageNumber} is not a table page`);
   }
   const node = readInterior(page);
-  for (const divider of node.dividers) walk(pager, divider.left, into);
-  walk(pager, node.right, into);
+  for (const divider of node.dividers) {
+    if (!walkUntil(pager, divider.left, visit)) return false;
+  }
+  return walkUntil(pager, node.right, visit);
 }
 
 function collectPages(pager: Pager, pageNumber: number): number[] {

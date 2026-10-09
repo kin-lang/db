@@ -69,6 +69,7 @@ A `.kindb` file is a script of those statements. A `.db` file is a page file, th
 - a value that does not fit in its cell continues on overflow pages
 - pages released by delete sit on a freelist and are reused
 - the file does not shrink; the freelist hands those pages out again
+- a save writes the pages that changed. The whole file is written when it is created, when it is still JSON, or when `save` is pointed at a new path
 
 An older JSON `.db` (`{ "kindb": 1, "db": { } }`) and a json-base file (`{ "$schema": "...", "db": { } }`) still open. The next save rewrites them as pages. `collections()` does not list the hidden schema table.
 
@@ -94,7 +95,7 @@ db.del({ collection: 'abanyeshuri', where: { id: 2 } })
 db.delAll()
 ```
 
-`Database.memory()` never touches the disk until `save(path)`. `execute` rolls memory back when a statement fails, and it does not write the file in that case. `get` returns copies of the rows.
+`Database.memory()` never touches the disk until `save(path)`. `execute` rolls the in-memory pages back when a statement fails, and it does not write the file in that case. The rollback keeps the previous page buffers; it does not copy the whole file. A statement that changes nothing does not rewrite the file. `add`, `set`, and `del` write the pages that changed. `get` returns copies of the rows. `imipaka` and `get(..., limit)` stop once that many rows have matched. An equality `huza` is hashed, so it does not build the cartesian product.
 
 `where` accepts the json-base operators `lt`, `lte`, `gt`, `gte`, and `eq`, plus `munsi`, `munsi_cyangwa`, `hejuru`, `hejuru_cyangwa`, and `ni`.
 

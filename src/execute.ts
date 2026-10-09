@@ -72,8 +72,8 @@ export function executeStatements(statements: Statement[], store: Store): Execut
         const rows = evaluateSelect(
           statement.from.map((ref) => ({
             ref,
-            rows: store.rows(ref.name),
             columns: store.columnNames(ref.name),
+            forEach: (visit: (row: Row) => boolean) => store.forEach(ref.name, visit),
           })),
           statement.where,
           statement.columns,

@@ -106,7 +106,9 @@ describe('Kinyarwanda SQL', () => {
       { id: 1, izina: null },
       { id: 2, izina: null },
     ]);
+    expect(db.query('hitamo id muri t aho id > 1 imipaka 1')).toEqual([{ id: 2 }]);
     expect(db.query('hitamo * muri t imipaka 0')).toEqual([]);
+    expect(db.get({ collection: 't', where: { id: { gt: 1 } }, limit: 1 })).toEqual([{ id: 2 }]);
   });
 
   test('deletes every match and refuses an empty where', () => {
@@ -219,6 +221,28 @@ describe('.db and .kindb files', () => {
     const result = Database.runFile(script, { db: file });
     expect(result.rows[0]).toEqual([{ izina: 'Aline', amanota: 88 }]);
     expect(Database.open(file).collections().sort()).toEqual(['abanyeshuri', 'abigisha']);
+  });
+
+  test('a read leaves the file untouched, and later writes patch it', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'ishuri.db');
+    const db = Database.open(file, { create: true });
+    db.execute('kora itsinda t shira muri t { id: 1, izina: "Aline" }');
+    const before = readFileSync(file);
+    expect(db.query('hitamo izina muri t imipaka 1')).toEqual([{ izina: 'Aline' }]);
+    expect(readFileSync(file)).toEqual(before);
+    for (let id = 2; id <= 40; id += 1) db.add({ collection: 't', data: { id, izina: `u${id}` } });
+    db.set({ collection: 't', where: { id: 2 }, data: { izina: 'Keza' } });
+    db.del({ collection: 't', where: { id: 3 } });
+    const opened = Database.open(file);
+    const rows = opened.get({ collection: 't' });
+    expect(rows).toHaveLength(39);
+    expect(rows.find((row) => row.id === 2)?.izina).toBe('Keza');
+    expect(rows.find((row) => row.id === 3)).toBeUndefined();
+    expect(readFileSync(file).length % PAGE_SIZE).toBe(0);
+    expect(readFileSync(file).subarray(0, 13).toString('utf8')).toBe('KinDB page v1');
+    opened.delAll();
+    expect(Database.open(file).collections()).toEqual([]);
   });
 
   test('does not write the file when a script fails', () => {
@@ -380,6 +404,41 @@ describe('pages, types, and join', () => {
     expect(() =>
       db.query('hitamo id muri abanyeshuri a huza abigisha b aho a.mwarimu = b.id'),
     ).toThrow(/ambiguous/);
+    expect(
+      db.query(`
+        hitamo a.izina, b.umwarimu
+        muri abanyeshuri a
+        huza abigisha b
+        aho a.mwarimu = b.id
+      `),
+    ).toEqual([
+      { izina: 'Aline', umwarimu: 'Mukama' },
+      { izina: 'Keza', umwarimu: 'Kalisa' },
+    ]);
+    expect(
+      db.query('hitamo a.izina, b.umwarimu muri abanyeshuri a huza abigisha b aho a.mwarimu = b.id imipaka 1'),
+    ).toEqual([{ izina: 'Aline', umwarimu: 'Mukama' }]);
+  });
+
+  test('loose equality joins a number to its numeric string, and ni does not', () => {
+    const db = Database.memory();
+    db.execute(`
+      kora itsinda abanyeshuri
+      kora itsinda abigisha
+      shira muri abanyeshuri { id: "1", izina: "Aline" }
+      shira muri abanyeshuri { id: "2", izina: "Keza" }
+      shira muri abigisha { id: 1, umwarimu: "Mukama" }
+      shira muri abigisha { id: 2, umwarimu: "Kalisa" }
+    `);
+    expect(
+      db.query('hitamo a.izina, b.umwarimu muri abanyeshuri a huza abigisha b aho a.id = b.id'),
+    ).toEqual([
+      { izina: 'Aline', umwarimu: 'Mukama' },
+      { izina: 'Keza', umwarimu: 'Kalisa' },
+    ]);
+    expect(
+      db.query('hitamo a.izina muri abanyeshuri a huza abigisha b aho a.id ni b.id'),
+    ).toEqual([]);
   });
 
   test('a tall btree keeps row order, spills overflow, and reuses the freelist', () => {
@@ -422,6 +481,20 @@ describe('pages, types, and join', () => {
     store.createCollection('t');
     store.add('t', { id: 1, izina: 'Aline' });
     expect(Store.fromBytes(store.toBytes()).rows('t')).toEqual([{ id: 1, izina: 'Aline' }]);
+  });
+
+  test('a snapshot keeps the pages from before a later write', () => {
+    const store = Store.empty();
+    store.createCollection('t');
+    store.add('t', { id: 1, izina: 'Aline' });
+    const snapshot = store.clone();
+    store.add('t', { id: 2, izina: 'Keza' });
+    store.updateWhere('t', [{ op: 'eq', field: 'id', value: 1 }], { izina: 'Aline 2' });
+    expect(snapshot.rows('t')).toEqual([{ id: 1, izina: 'Aline' }]);
+    expect(store.rows('t')).toEqual([
+      { id: 1, izina: 'Aline 2' },
+      { id: 2, izina: 'Keza' },
+    ]);
   });
 });
 

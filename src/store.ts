@@ -1,5 +1,5 @@
 import { KinDbError } from './errors';
-import { deleteTree, freeTree, insertTree, scanTree } from './pager/btree';
+import { deleteTree, freeTree, insertTree, scanTree, scanUntil } from './pager/btree';
 import { blankLeaf } from './pager/format';
 import { Pager } from './pager/pager';
 import {
@@ -92,11 +92,16 @@ export class Store {
   }
 
   clone(): Store {
-    return Store.fromBytes(this.toBytes());
+    return new Store(this.pager.snapshot());
   }
 
   toBytes(): Buffer {
     return this.pager.toBuffer();
+  }
+
+  /** Write changed pages. `full` replaces the file instead of patching it. */
+  writeTo(filePath: string, full = false): void {
+    this.pager.writeTo(filePath, full);
   }
 
   get pageCount(): number {
@@ -165,7 +170,17 @@ export class Store {
 
   get(collection: string, where?: Where, limit?: number): Row[] {
     const predicates = where ? whereToPredicates(where) : [];
-    return this.filter(this.rows(collection), predicates, limit);
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+      throw new KinDbError('E_TYPE', 'Limit must be a non-negative integer');
+    }
+    if (limit === 0) return [];
+    const matched: Row[] = [];
+    this.forEach(collection, (row) => {
+      if (!matches(row, predicates)) return true;
+      matched.push(row);
+      return limit === undefined || matched.length < limit;
+    });
+    return matched;
   }
 
   set(collection: string, where: Where, data: Row): void {
@@ -187,6 +202,14 @@ export class Store {
     const table = this.require(collection);
     return scanTree(this.pager, table.root).map((record) =>
       decodeRecord(table.columns, record.payload),
+    );
+  }
+
+  /** Walk rows in table order. `visit` returns false to stop. */
+  forEach(collection: string, visit: (row: Row) => boolean): void {
+    const table = this.require(collection);
+    scanUntil(this.pager, table.root, (record) =>
+      visit(decodeRecord(table.columns, record.payload)),
     );
   }
 
