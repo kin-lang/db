@@ -44,6 +44,14 @@ export function scanTree(pager: Pager, root: number): StoredRecord[] {
   return found;
 }
 
+/** One row by its id, or null when the table has no such row. */
+export function findTree(pager: Pager, root: number, rowid: number): StoredRecord | null {
+  const path = descend(pager, root, rowid);
+  const cell = readLeaf(pager.get(path.leaf)).find((item) => item.rowid === rowid);
+  if (!cell) return null;
+  return { rowid: cell.rowid, payload: readPayload(pager, cell), overflow: cell.overflow };
+}
+
 export function insertTree(pager: Pager, root: number, rowid: number, payload: Buffer): number {
   const cell = spill(pager, rowid, payload);
   return place(pager, root, cell).root;

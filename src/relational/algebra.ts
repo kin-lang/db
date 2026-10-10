@@ -1,4 +1,5 @@
 import { KinDbError } from '../errors';
+import { encodeIndexKey, type Bound } from '../pager/index-key';
 import type { ColumnRef, TableRef } from '../parser/ast';
 import {
   cloneJson,
@@ -9,6 +10,7 @@ import {
   type Predicate,
   type Row,
 } from '../value';
+import { planRead } from './planner';
 
 /**
  * One tuple in a relation. `sources` keeps each input row addressable
@@ -23,15 +25,28 @@ export interface Scope {
 export interface InputRelation {
   ref: TableRef;
   columns: string[];
+  /** Columns that have a simple index, in creation order. */
+  indexed: string[];
   /** Walk rows in table order. Return false from `visit` to stop. */
   forEach(visit: (row: Row) => boolean): void;
+  /** Rows whose indexed value encodes to `key`, in row id order. */
+  probe(column: string, key: Buffer, visit: (row: Row) => boolean): void;
+  /** Rows in index order, not row id order. */
+  range(
+    column: string,
+    low: Bound | null,
+    high: Bound | null,
+    visit: (row: Row, rowid: number) => boolean,
+  ): void;
 }
 
 /**
  * Run a select as relational operators only:
  * selection on each input, theta-join for `huza`, then selection of whatever
  * predicate still crosses the result, then projection and limit.
- * A limit stops the scan, or the last join, once enough rows match.
+ * A point or a bounded range uses an index when one exists. An equality join
+ * probes the inner index when the query has a limit or the outer side is an
+ * equality; otherwise it is hashed. A limit stops once enough rows match.
  */
 export function evaluateSelect(
   inputs: InputRelation[],
@@ -64,17 +79,22 @@ export function evaluateSelect(
     }
   }
   if (limit === 0) return [];
-  if (inputs.length === 1) return selectOne(inputs[0], where, columns, limit);
+  if (inputs.length === 1) {
+    const rows: Row[] = [];
+    streamBase(inputs[0], where, (scope) => {
+      rows.push(projectScope(scope, columns));
+      return limit === undefined || rows.length < limit;
+    });
+    return rows;
+  }
 
   const pending = [...where];
-  let scopes = collect(inputs[0], take(pending, (predicate) => covers(predicate, inputs[0])));
-  for (let index = 1; index < inputs.length; index += 1) {
-    const right = inputs[index];
-    const rightScopes = collect(right, take(pending, (predicate) => covers(predicate, right)));
-    const joinOn = take(pending, (predicate) => crosses(predicate, inputs.slice(0, index), right));
-    const last = index === inputs.length - 1;
-    scopes = produceJoin(scopes, rightScopes, joinOn, last ? pending.splice(0) : [], last ? limit : undefined);
-  }
+  const residual = take(pending, (predicate) => !attached(predicate, inputs));
+  const scopes: Scope[] = [];
+  produce(inputs, pending, residual, inputs.length - 1, limit, limit !== undefined, (scope) => {
+    scopes.push(scope);
+    return limit === undefined || scopes.length < limit;
+  });
   return project(scopes, columns);
 }
 
@@ -92,32 +112,149 @@ export function project(scopes: Scope[], columns: '*' | ColumnRef[]): Row[] {
   return scopes.map((scope) => projectScope(scope, columns));
 }
 
-function selectOne(
+function streamBase(
   input: InputRelation,
-  where: Predicate[],
-  columns: '*' | ColumnRef[],
-  limit: number | undefined,
-): Row[] {
-  const rows: Row[] = [];
-  const name = input.ref.alias ?? input.ref.name;
-  input.forEach((row) => {
+  predicates: Predicate[],
+  onScope: (scope: Scope) => boolean,
+): void {
+  const name = qualifierOf(input);
+  const access = planRead(predicates, input.indexed, name);
+  const emit = (row: Row): boolean => {
     const scope: Scope = { row, sources: { [name]: row }, primary: name };
-    if (!where.every((predicate) => holds(scope, predicate))) return true;
-    rows.push(projectScope(scope, columns));
-    return limit === undefined || rows.length < limit;
-  });
-  return rows;
+    if (!predicates.every((predicate) => holds(scope, predicate))) return true;
+    return onScope(scope);
+  };
+  if (access.kind === 'empty') return;
+  if (access.kind === 'point') {
+    input.probe(access.column, access.key, emit);
+    return;
+  }
+  if (access.kind === 'range') {
+    // Index order is not table order. Sort by row id, then recheck.
+    const hits: { row: Row; rowid: number }[] = [];
+    input.range(access.column, access.low, access.high, (row, rowid) => {
+      hits.push({ row, rowid });
+      return true;
+    });
+    hits.sort((a, b) => a.rowid - b.rowid);
+    for (const hit of hits) {
+      if (!emit(hit.row)) return;
+    }
+    return;
+  }
+  input.forEach(emit);
 }
 
-function collect(input: InputRelation, predicates: Predicate[]): Scope[] {
-  const name = input.ref.alias ?? input.ref.name;
-  const scopes: Scope[] = [];
-  input.forEach((row) => {
-    const scope: Scope = { row, sources: { [name]: row }, primary: name };
-    if (predicates.every((predicate) => holds(scope, predicate))) scopes.push(scope);
+function produce(
+  inputs: InputRelation[],
+  pending: Predicate[],
+  residual: Predicate[],
+  end: number,
+  limit: number | undefined,
+  stoppable: boolean,
+  onScope: (scope: Scope) => boolean,
+): void {
+  if (end === 0) {
+    streamBase(inputs[0], take(pending, (predicate) => covers(predicate, inputs[0])), onScope);
+    return;
+  }
+  const right = inputs[end];
+  const leftInputs = inputs.slice(0, end);
+  const rightPreds = take(pending, (predicate) => covers(predicate, right));
+  const joinOn = take(pending, (predicate) => crosses(predicate, leftInputs, right));
+  const link = indexLink(joinOn, leftInputs, right);
+  const leftPoint =
+    leftInputs.length === 1 &&
+    planRead(
+      pending.filter((predicate) => covers(predicate, leftInputs[0])),
+      leftInputs[0].indexed,
+      qualifierOf(leftInputs[0]),
+    ).kind === 'point';
+  const extras = end === inputs.length - 1 ? residual : [];
+  if (link && (stoppable || leftPoint)) {
+    produce(inputs, pending, residual, end - 1, undefined, true, (leftScope) =>
+      probeRight(leftScope, right, rightPreds, joinOn, link, extras, onScope),
+    );
+    return;
+  }
+  const leftScopes: Scope[] = [];
+  produce(inputs, pending, residual, end - 1, undefined, false, (scope) => {
+    leftScopes.push(scope);
     return true;
   });
-  return scopes;
+  const rightScopes: Scope[] = [];
+  streamBase(right, rightPreds, (scope) => {
+    rightScopes.push(scope);
+    return true;
+  });
+  const joined = produceJoin(
+    leftScopes,
+    rightScopes,
+    joinOn,
+    extras,
+    end === inputs.length - 1 ? limit : undefined,
+  );
+  for (const scope of joined) {
+    if (!onScope(scope)) return;
+  }
+}
+
+function probeRight(
+  leftScope: Scope,
+  right: InputRelation,
+  rightPreds: Predicate[],
+  joinOn: Predicate[],
+  link: EquiLink,
+  residual: Predicate[],
+  onScope: (scope: Scope) => boolean,
+): boolean {
+  const raw = readColumn(leftScope, link.leftQualifier, link.leftField);
+  if (raw === undefined) return true;
+  if (link.op === 'eq' && typeof raw !== 'number') return true;
+  const key = encodeIndexKey(raw);
+  if (!key) return true;
+  const name = qualifierOf(right);
+  let keep = true;
+  right.probe(link.rightField, key, (row) => {
+    const rightScope: Scope = { row, sources: { [name]: row }, primary: name };
+    if (!rightPreds.every((predicate) => holds(rightScope, predicate))) return true;
+    const sources = { ...leftScope.sources, ...rightScope.sources };
+    const preview: Scope = { row: leftScope.row, sources, primary: leftScope.primary };
+    if (!joinOn.every((predicate) => holds(preview, predicate))) return true;
+    if (!residual.every((predicate) => holds(preview, predicate))) return true;
+    keep = onScope({
+      row: mergeRows(leftScope.row, row, leftScope.primary, name),
+      sources,
+      primary: leftScope.primary,
+    });
+    return keep;
+  });
+  return keep;
+}
+
+function indexLink(
+  predicates: Predicate[],
+  left: InputRelation[],
+  right: InputRelation,
+): EquiLink | null {
+  if (right.indexed.length === 0) return null;
+  const leftNames = new Set(left.map(qualifierOf));
+  const rightNames = new Set([qualifierOf(right)]);
+  const leftFields = new Set(left.flatMap((input) => input.columns));
+  const rightFields = new Set(right.columns);
+  for (const predicate of predicates) {
+    const link = asEqui(predicate, leftNames, rightNames, leftFields, rightFields);
+    if (link && right.indexed.includes(link.rightField)) return link;
+  }
+  return null;
+}
+
+function attached(predicate: Predicate, inputs: InputRelation[]): boolean {
+  if (inputs.some((input) => covers(predicate, input))) return true;
+  for (let index = 1; index < inputs.length; index += 1) {
+    if (crosses(predicate, inputs.slice(0, index), inputs[index])) return true;
+  }
+  return false;
 }
 
 interface EquiLink {

@@ -26,6 +26,9 @@ siba byose
 hitamo * muri abanyeshuri
 hitamo izina, amanota muri abanyeshuri aho amanota >= 50 kandi yize = nibyo imipaka 10
 hitamo a.izina, b.umwarimu muri abanyeshuri a huza abigisha b aho a.mwarimu = b.id
+
+kora urutonde abanyeshuri_id muri abanyeshuri (id)
+siba urutonde abanyeshuri_id
 ```
 
 | Statement | SQL | json-base |
@@ -39,6 +42,8 @@ hitamo a.izina, b.umwarimu muri abanyeshuri a huza abigisha b aho a.mwarimu = b.
 | `siba muri ... aho` | `DELETE` | `del` (every match) |
 | `siba itsinda` | drop table | delete that key |
 | `siba byose` | wipe | `delAll` |
+| `kora urutonde name muri table (column)` | index on one column | — |
+| `siba urutonde name` | drop that index | — |
 
 `aho` comparisons are combined with `kandi` only.
 
@@ -56,6 +61,8 @@ Values are numbers, `"strings"`, `nibyo`, `sibyo`, and `ubusa`.
 `kora itsinda` may list columns and types: `umubare` (number), `ijambo` (string), `ukuri` (`nibyo` or `sibyo`), and `ikintu` (any JSON value). Without that list, columns appear when you insert. A declared column rejects a value of the wrong type. `null` (`ubusa`) is allowed in every column.
 
 `huza` is an inner join. `aho` is selection. A predicate that names one table is applied to that table, and a predicate that names both sides is the join condition. Use an alias when the same table appears twice (`muri abanyeshuri a huza abanyeshuri b`). There is no `OR`, no outer join, no `ORDER BY`, and no `GROUP BY`.
+
+`kora urutonde` builds an index on one column. An index cannot list two columns. `collections()` does not list indexes. Dropping a table drops the indexes on it. The planner uses an index for an equality lookup and for a bounded comparison such as `amanota > 50 kandi amanota < 90`. An equality `huza` probes the inner index when the query has `imipaka`, or when the outer side is itself an equality. A full equality join with no limit stays hashed. Rows come back in stored order. The original predicate is checked again, so `1` still matches `"1"` and `ni` still does not.
 
 `hindura` changes the fields you list and leaves the others in place. Numbers stay numbers.
 
@@ -97,7 +104,7 @@ db.delAll()
 
 `Database.memory()` never touches the disk until `save(path)`. `execute` rolls the in-memory pages back when a statement fails, and it does not write the file in that case. The rollback keeps the previous page buffers; it does not copy the whole file. A statement that changes nothing does not rewrite the file. `add`, `set`, and `del` write the pages that changed. `get` returns copies of the rows. `imipaka` and `get(..., limit)` stop once that many rows have matched. An equality `huza` is hashed, so it does not build the cartesian product.
 
-`where` accepts the json-base operators `lt`, `lte`, `gt`, `gte`, and `eq`, plus `munsi`, `munsi_cyangwa`, `hejuru`, `hejuru_cyangwa`, and `ni`.
+`where` accepts the json-base operators `lt`, `lte`, `gt`, `gte`, and `eq`, plus `munsi`, `munsi_cyangwa`, `hejuru`, `hejuru_cyangwa`, and `ni`. `get`, `set`, and `del` use the same planner as `hitamo`, so an equality on an indexed column does not walk the table.
 
 ```ts
 const script = new URL('./examples/ishuri.kindb', import.meta.url)
@@ -153,6 +160,8 @@ Failures throw `KinDbError` with a `code`:
 | `E_SYNTAX` | The script does not parse. `incomplete` is true at EOF mid-statement. |
 | `E_COLLECTION_MISSING` | The collection is not in the database. |
 | `E_COLLECTION_EXISTS` | `kora itsinda` used an existing name. |
+| `E_INDEX_EXISTS` | The index name is taken, or that column already has an index. |
+| `E_INDEX_MISSING` | `siba urutonde` named an index that is not there. |
 | `E_MISSING_PARAM` | `where` or another required piece is missing. |
 | `E_NOT_FOUND` | `hindura` / `siba` matched nothing. |
 | `E_DUPLICATE` | `hindura` matched more than one row. |

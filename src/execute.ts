@@ -1,3 +1,4 @@
+import type { Bound } from './pager/index-key';
 import { evaluateSelect } from './relational/algebra';
 import type { Statement } from './parser/ast';
 import { parse } from './parser/parser';
@@ -14,7 +15,9 @@ export interface ExecuteResult {
   last:
     | { kind: 'empty' }
     | { kind: 'create' }
+    | { kind: 'createIndex' }
     | { kind: 'drop' }
+    | { kind: 'dropIndex' }
     | { kind: 'dropAll' }
     | { kind: 'insert'; row: Row }
     | { kind: 'update'; count: number }
@@ -42,9 +45,17 @@ export function executeStatements(statements: Statement[], store: Store): Execut
         store.createCollection(statement.name, statement.columns);
         result.last = { kind: 'create' };
         break;
+      case 'createIndex':
+        store.createIndex(statement.name, statement.collection, statement.column);
+        result.last = { kind: 'createIndex' };
+        break;
       case 'drop':
         store.dropCollection(statement.name);
         result.last = { kind: 'drop' };
+        break;
+      case 'dropIndex':
+        store.dropIndex(statement.name);
+        result.last = { kind: 'dropIndex' };
         break;
       case 'dropAll':
         store.delAll();
@@ -73,7 +84,16 @@ export function executeStatements(statements: Statement[], store: Store): Execut
           statement.from.map((ref) => ({
             ref,
             columns: store.columnNames(ref.name),
+            indexed: store.indexedColumns(ref.name),
             forEach: (visit: (row: Row) => boolean) => store.forEach(ref.name, visit),
+            probe: (column: string, key: Buffer, visit: (row: Row) => boolean) =>
+              store.probe(ref.name, column, key, visit),
+            range: (
+              column: string,
+              low: Bound | null,
+              high: Bound | null,
+              visit: (row: Row, rowid: number) => boolean,
+            ) => store.scanRange(ref.name, column, low, high, visit),
           })),
           statement.where,
           statement.columns,

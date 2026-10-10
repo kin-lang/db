@@ -122,4 +122,92 @@ describe('speed', () => {
     expect(rows.find((row) => row.id === 5080)?.izina).toBe('x');
     expect(readFileSync(file).length % PAGE_SIZE).toBe(0);
   });
+
+  test('an index point lookup stays cheaper than reading the table', () => {
+    const db = Database.memory();
+    db.execute('kora itsinda t (id umubare, izina ijambo)');
+    const payload = 'z'.repeat(400);
+    for (let id = 1; id <= 4000; id += 1) db.add({ collection: 't', data: { id, izina: payload } });
+    db.execute('kora urutonde t_id muri t (id)');
+
+    const full = elapsed(() => {
+      expect(db.query('hitamo id muri t')).toHaveLength(4000);
+    });
+    const lookups = elapsed(() => {
+      for (let i = 0; i < 8; i += 1) {
+        const id = (i * 97) % 4000 + 1;
+        expect(db.query(`hitamo id muri t aho id = ${id} imipaka 1`)).toEqual([{ id }]);
+      }
+    });
+    // Eight scans of the fat table cost more than eight index lookups.
+    expect(lookups).toBeLessThan(full);
+  });
+
+  test('a limited equality join probes the inner index', () => {
+    const db = Database.memory();
+    db.execute(`
+      kora itsinda t (id umubare)
+      kora itsinda s (id umubare, izina ijambo)
+    `);
+    const payload = 'z'.repeat(500);
+    for (let id = 1; id <= 2000; id += 1) {
+      db.add({ collection: 't', data: { id } });
+      db.add({ collection: 's', data: { id, izina: payload } });
+    }
+    db.execute('kora urutonde s_id muri s (id)');
+    expect(db.query('hitamo a.id, b.izina muri t a huza s b aho a.id = b.id imipaka 1')).toEqual([
+      { id: 1, izina: payload },
+    ]);
+
+    const scan = elapsed(() => {
+      expect(db.query('hitamo id muri s')).toHaveLength(2000);
+    });
+    const joins = elapsed(() => {
+      for (let i = 0; i < 10; i += 1) {
+        const rows = db.query(
+          'hitamo a.id muri t a huza s b aho a.id = b.id imipaka 5',
+        );
+        expect(rows.map((row) => row.id)).toEqual([1, 2, 3, 4, 5]);
+      }
+    });
+    // Hashing both sides reads every fat row. Ten limited probes must not.
+    expect(joins).toBeLessThan(scan);
+  });
+
+  test('updating by an indexed column does not scan the table', () => {
+    const db = Database.memory();
+    db.execute('kora itsinda t (id umubare, izina ijambo, n umubare)');
+    const payload = 'z'.repeat(400);
+    for (let id = 1; id <= 3000; id += 1) {
+      db.add({ collection: 't', data: { id, izina: payload, n: 0 } });
+    }
+    db.execute('kora urutonde t_id muri t (id)');
+
+    const scans = elapsed(() => {
+      for (let i = 0; i < 6; i += 1) expect(db.query('hitamo id muri t')).toHaveLength(3000);
+    });
+    const updates = elapsed(() => {
+      for (let id = 1; id <= 30; id += 1) {
+        db.execute(`hindura t shyira n = ${id} aho id = ${id}`);
+      }
+    });
+    expect(updates).toBeLessThan(scans);
+    expect(db.get({ collection: 't', where: { id: 1 } })[0].n).toBe(1);
+    expect(db.get({ collection: 't', where: { id: 30 } })[0].n).toBe(30);
+  });
+
+  test('inserts with one index stay linear', () => {
+    const db = Database.memory();
+    db.execute('kora itsinda t (id umubare); kora urutonde t_id muri t (id)');
+    const inserting = elapsed(() => {
+      for (let id = 1; id <= 2000; id += 1) db.add({ collection: 't', data: { id } });
+    });
+    // Rebuilding the index on every insert would be far past this.
+    expect(inserting).toBeLessThan(800);
+    expect(db.get({ collection: 't', where: { id: 1 } })).toEqual([{ id: 1 }]);
+    expect(db.get({ collection: 't', where: { id: 2000 } })).toEqual([{ id: 2000 }]);
+    expect(db.query('hitamo id muri t aho id > 1990 kandi id < 1995').map((row) => row.id)).toEqual([
+      1991, 1992, 1993, 1994,
+    ]);
+  });
 });

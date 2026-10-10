@@ -48,6 +48,7 @@ class Parser {
 
   private createStatement(): Statement {
     this.expect('kora');
+    if (this.matchWord('urutonde')) return this.createIndex();
     this.expect('itsinda');
     const name = this.identifier();
     if (!this.match('lparen')) return { kind: 'create', name };
@@ -60,10 +61,24 @@ class Parser {
     return { kind: 'create', name, columns };
   }
 
+  private createIndex(): Statement {
+    const name = this.identifier();
+    this.expect('muri');
+    const collection = this.identifier();
+    this.expect('lparen');
+    const column = this.identifier();
+    if (this.check('comma')) {
+      throw this.syntax('An index covers one column', false);
+    }
+    this.expect('rparen');
+    return { kind: 'createIndex', name, collection, column };
+  }
+
   private deleteOrDrop(): Statement {
     this.expect('siba');
     if (this.match('byose')) return { kind: 'dropAll' };
     if (this.match('itsinda')) return { kind: 'drop', name: this.identifier() };
+    if (this.matchWord('urutonde')) return { kind: 'dropIndex', name: this.identifier() };
     this.expect('muri');
     const collection = this.identifier();
     this.expect('aho');
@@ -299,6 +314,14 @@ class Parser {
 
   private startsStatement(type: TokenType): boolean {
     return type === 'kora' || type === 'siba' || type === 'shira' || type === 'hindura' || type === 'hitamo';
+  }
+
+  /** `urutonde` is not reserved, so a column may still use that name. */
+  private matchWord(word: string): boolean {
+    const token = this.peek();
+    if (token.type !== 'identifier' || token.lexeme.toLowerCase() !== word) return false;
+    this.advance();
+    return true;
   }
 
   private match(type: TokenType): boolean {
