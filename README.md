@@ -2,7 +2,7 @@
 
 In-memory relational database with **Kinyarwanda SQL**. Records live in named tables. CRUD matches [`json-base`](https://www.npmjs.com/package/@ndzhwr/json-base): get (with `where` and `limit`), add, set, del, and delAll. The relational operators are selection (`aho`) and inner join (`huza`).
 
-The package is standalone. It reads and writes a `.db` page file, runs a `.kindb` script, and is what Kin calls through `KIN_UBUBIKO`.
+The package is standalone. It reads and writes a `.db` page file, runs a `.kindb` script, and is what Kin calls through `KIN_UBUBIKO`. Collection models are imported from `@kin-lang/db/orm`.
 
 ```bash
 npm install @kin-lang/db
@@ -102,7 +102,20 @@ db.del({ collection: 'abanyeshuri', where: { id: 2 } })
 db.delAll()
 ```
 
-`Database.memory()` never touches the disk until `save(path)`. `execute` rolls the in-memory pages back when a statement fails, and it does not write the file in that case. The rollback keeps the previous page buffers; it does not copy the whole file. A statement that changes nothing does not rewrite the file. `add`, `set`, and `del` write the pages that changed. `get` returns copies of the rows. `imipaka` and `get(..., limit)` stop once that many rows have matched. An equality `huza` is hashed, so it does not build the cartesian product.
+```ts
+const rows = db.transaction((tx) => {
+  tx.createCollection('abanyeshuri')
+  tx.add({ collection: 'abanyeshuri', data: { id: 1, izina: 'Aline', amanota: 88 } })
+  tx.add({ collection: 'abanyeshuri', data: { id: 2, izina: 'Keza', amanota: 41 } })
+  tx.set({ collection: 'abanyeshuri', where: { id: 1 }, data: { amanota: 95 } })
+  tx.del({ collection: 'abanyeshuri', where: { id: 2 } })
+  return tx.get({ collection: 'abanyeshuri' })
+})
+```
+
+`Database.memory()` never touches the disk until `save(path)`. `execute` rolls the in-memory pages back when a statement fails, and it does not write the file in that case. The rollback keeps the previous page buffers; it does not copy the whole file. A statement that changes nothing does not rewrite the file. Outside a transaction, `add`, `set`, and `del` write the pages that changed. `get` returns copies of the rows. `imipaka` and `get(..., limit)` stop once that many rows have matched. An equality `huza` is hashed, so it does not build the cartesian product.
+
+`transaction(callback)` is the explicit way to group those writes. The callback receives a transaction handle with the same methods. `add`, `set`, `del`, `execute`, and the other mutating methods — on that handle or on the database — change memory only while the callback runs. They do not each write the file. A model from `@kin-lang/db/orm` joins that transaction through `kora`, `shira`, `hindura`, and `siba`. The file is written once when the outermost callback returns. A throw restores the pages from the start of that callback and leaves the file untouched. The callback must finish synchronously; a returned promise is rejected and the changes are rolled back. `save()` inside a callback throws `E_TRANSACTION`. A nested `transaction()` is a savepoint: catching its error keeps the outer changes, and only the outermost success writes the file.
 
 `where` accepts the json-base operators `lt`, `lte`, `gt`, `gte`, and `eq`, plus `munsi`, `munsi_cyangwa`, `hejuru`, `hejuru_cyangwa`, and `ni`. `get`, `set`, and `del` use the same planner as `hitamo`, so an equality on an indexed column does not walk the table.
 
@@ -110,6 +123,42 @@ db.delAll()
 const script = new URL('./examples/ishuri.kindb', import.meta.url)
 Database.runFile(script, { db: './ishuri.db' })
 ```
+
+## ORM
+
+`import { model } from '@kin-lang/db/orm'` describes one collection. `on` binds that description to a database or a transaction. `kora`, `shira`, `hitamo`, `hindura`, and `siba` call that session. Inside `transaction()`, those calls change memory only, and the file is written once when the outermost callback returns.
+
+Field types are `number`, `string`, `boolean`, and `any`. The Kinyarwanda names `umubare`, `ijambo`, `ukuri`, and `ikintu` name the same types. `null` is allowed in every field. `shira` and `hindura` accept the listed fields, and a value has to match its field. `where` uses the same comparisons as `Database.get`. Each key has to be a field on the model.
+
+```ts
+import { Database } from '@kin-lang/db'
+import { model } from '@kin-lang/db/orm'
+
+const Abanyeshuri = model('abanyeshuri', {
+  id: 'number',
+  izina: 'string',
+  amanota: 'number',
+  yize: 'boolean',
+})
+
+const db = Database.open('./ishuri.db', { create: true })
+const abanyeshuri = Abanyeshuri.on(db)
+abanyeshuri.kora()
+abanyeshuri.shira({ id: 1, izina: 'Aline', amanota: 88, yize: true })
+abanyeshuri.shira({ id: 2, izina: 'Keza', amanota: 41, yize: false })
+abanyeshuri.hitamo({ where: { amanota: { gte: 50 } }, limit: 10 })
+abanyeshuri.hindura({ where: { id: 1 }, data: { amanota: 90 } })
+abanyeshuri.siba({ where: { id: 2 } })
+
+const rows = db.transaction((tx) => {
+  const scoped = Abanyeshuri.on(tx)
+  scoped.shira({ id: 3, izina: 'Kaliza', amanota: 70, yize: true })
+  scoped.hindura({ where: { id: 1 }, data: { amanota: 95 } })
+  return scoped.hitamo()
+})
+```
+
+`kora` fails when the collection already exists. The same `model(...)` value can be bound to more than one database.
 
 ## CLI
 
@@ -144,10 +193,27 @@ From a `.kin` file, after this package is installed next to Kin:
 reka db = KIN_UBUBIKO.fungura("ishuri.db")
 db.baza("KORA ITSINDA abanyeshuri")
 db.shira("abanyeshuri", { id: 1, izina: "Aline", amanota: 88 })
+db.shira("abanyeshuri", { id: 2, izina: "Keza", amanota: 41 })
 reka abatsinze = db.hitamo("abanyeshuri", { amanota: { hejuru_cyangwa: 50 } })
 tangaza_amakuru(abatsinze)
-db.bika()
+
+porogaramu_ntoya andika(tx) {
+  tx.shira("abanyeshuri", { id: 3, izina: "Kaliza", amanota: 70 })
+  tx.hindura("abanyeshuri", { id: 1 }, { amanota: 95 })
+  tx.siba("abanyeshuri", { id: 2 })
+}
+db.igikorwa(andika)
+
+reka Abanyeshuri = db.icyitegererezo("abanyeshuri", {
+  id: "umubare",
+  izina: "ijambo",
+  amanota: "umubare"
+})
+Abanyeshuri.shira({ id: 4, izina: "Kaliza", amanota: 70 })
+reka batsinze = Abanyeshuri.hitamo({ amanota: { hejuru_cyangwa: 50 } })
 ```
+
+`igikorwa` is `transaction`. `shira`, `hindura`, and `siba` inside it do not write on their own. The file is written once when the function returns. `bika` inside `igikorwa` is an error. `icyitegererezo` is the model for one collection, imported in JavaScript from `@kin-lang/db/orm`. `kora`, `shira`, `hindura`, and `siba` on that model join an open `igikorwa`. The collection already exists from `baza`, so this model does not call `kora`.
 
 `KIN_UBUBIKO.mu_mutwe()` is a memory database. Paths are relative to the `.kin` file, same as `KIN_INYANDIKO`. See `examples/ububiko` in the Kin repository.
 
@@ -166,8 +232,9 @@ Failures throw `KinDbError` with a `code`:
 | `E_NOT_FOUND` | `hindura` / `siba` matched nothing. |
 | `E_DUPLICATE` | `hindura` matched more than one row. |
 | `E_OPERATOR` | The comparison is not one of lt/gt/lte/gte/eq. |
-| `E_TYPE` | A value, limit, or name has the wrong shape. |
+| `E_TYPE` | A value, limit, name, or model field has the wrong shape. |
 | `E_IO` | The `.db` or `.kindb` file cannot be read or written. |
+| `E_TRANSACTION` | `save()` ran inside a transaction, or the callback returned a promise. |
 
 ## Development
 
@@ -177,4 +244,4 @@ npm test
 npm run build
 ```
 
-The published entry is `dist/index.js`. The `kindb` binary is `dist/cli.js`.
+The published entries are `dist/index.js` and `dist/orm.js` (`@kin-lang/db/orm`). The `kindb` binary is `dist/cli.js`.

@@ -20,6 +20,30 @@ export interface RunFileOptions {
 }
 
 /**
+ * The database handle passed to {@link Database.transaction}.
+ * Its methods are the same mutations as {@link Database}, but they do not
+ * write the file. The open transaction writes once, when its callback returns.
+ */
+export interface Transaction {
+  execute(source: string): ExecuteResult;
+  /** Run a script whose last statement must be HITAMO. Returns those rows. */
+  query(source: string): Row[];
+  collections(): string[];
+  createCollection(name: string, columns?: ColumnDef[]): void;
+  dropCollection(name: string): void;
+  add(params: { collection: string; data: Row }): Row;
+  get(params: { collection: string; where?: Where; limit?: number }): Row[];
+  set(params: { collection: string; where: Where; data: Row }): void;
+  del(params: { collection: string; where: Where }): number;
+  delAll(): void;
+  /**
+   * A nested transaction is a savepoint. It does not write the file.
+   * A throw restores only the changes made inside this callback.
+   */
+  transaction<T>(body: (tx: Transaction) => T): T;
+}
+
+/**
  * In-memory relational database that can be tied to a `.db` page file.
  * Kinyarwanda SQL is executed with {@link Database.execute}. The same data
  * is available through get / add / set / del / delAll.
@@ -27,6 +51,8 @@ export interface RunFileOptions {
 export class Database {
   private store: Store;
   private filePath: string | null;
+  /** Open transaction callbacks. Mutations skip the file until the outermost one returns. */
+  private transactionDepth = 0;
 
   private constructor(store: Store, filePath: string | null) {
     this.store = store;
@@ -70,8 +96,47 @@ export class Database {
   }
 
   /**
+   * Run `body` as one transaction.
+   *
+   * `add`, `set`, `del`, and the other mutating methods change memory only
+   * while `body` is running, whether they are called on `tx` or on this
+   * database. They do not each write the file. The file is written once
+   * when the outermost callback returns. A throw restores the pages from
+   * the start of this callback and does not write.
+   *
+   * The callback must finish synchronously. A nested {@link transaction}
+   * is a savepoint: catching its error keeps the outer changes.
+   */
+  transaction<T>(body: (tx: Transaction) => T): T {
+    if (typeof body !== 'function') {
+      throw new KinDbError('E_TYPE', 'transaction() expects a function');
+    }
+    const snapshot = this.store.clone();
+    this.transactionDepth += 1;
+    let released = false;
+    try {
+      const value = body(transactionView(this));
+      if (isThenable(value)) {
+        throw new KinDbError(
+          'E_TRANSACTION',
+          'transaction() callback must finish synchronously',
+        );
+      }
+      this.transactionDepth -= 1;
+      released = true;
+      if (this.transactionDepth === 0) this.commit();
+      return value;
+    } catch (error) {
+      this.store = snapshot;
+      if (!released) this.transactionDepth -= 1;
+      throw error;
+    }
+  }
+
+  /**
    * Run Kinyarwanda SQL. A failure rolls the in-memory data back to the
    * state before this call, and does not write the `.db` file.
+   * Inside {@link transaction}, the write waits for that callback to return.
    */
   execute(source: string): ExecuteResult {
     const snapshot = this.store.clone();
@@ -96,6 +161,12 @@ export class Database {
 
   /** Write the `.db` file. Passing a path binds future saves to that file. */
   save(filePath?: string): void {
+    if (this.transactionDepth > 0) {
+      throw new KinDbError(
+        'E_TRANSACTION',
+        'save() cannot run inside a transaction. The transaction writes the file when the callback returns',
+      );
+    }
     if (filePath) {
       const next = resolve(filePath);
       const full = next !== this.filePath;
@@ -150,9 +221,34 @@ export class Database {
   }
 
   private commit(): void {
+    if (this.transactionDepth > 0) return;
     if (!this.filePath) return;
     this.store.writeTo(this.filePath, false);
   }
+}
+
+function transactionView(db: Database): Transaction {
+  return {
+    execute: (source) => db.execute(source),
+    query: (source) => db.query(source),
+    collections: () => db.collections(),
+    createCollection: (name, columns) => db.createCollection(name, columns),
+    dropCollection: (name) => db.dropCollection(name),
+    add: (params) => db.add(params),
+    get: (params) => db.get(params),
+    set: (params) => db.set(params),
+    del: (params) => db.del(params),
+    delAll: () => db.delAll(),
+    transaction: (body) => db.transaction(body),
+  };
+}
+
+function isThenable(value: unknown): boolean {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
 }
 
 function readStore(filePath: string): Store {
