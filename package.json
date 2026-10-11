@@ -18,6 +18,12 @@
       "require": "./dist/index.js",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./orm": {
+      "types": "./dist/orm.d.ts",
+      "require": "./dist/orm.js",
+      "import": "./dist/orm.js",
+      "default": "./dist/orm.js"
     }
   },
   "engines": {
@@ -34,7 +40,8 @@
     "database",
     "json",
     "sql",
-    "kindb"
+    "kindb",
+    "orm"
   ],
   "author": "Kin contributors",
   "license": "MIT",

@@ -551,6 +551,133 @@ describe('table output', () => {
   });
 });
 
+describe('transactions', () => {
+  test('add, set, and del write the file once when the callback returns', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'ishuri.db');
+    const db = Database.open(file, { create: true });
+    db.createCollection('abanyeshuri');
+    db.add({ collection: 'abanyeshuri', data: { id: 2, izina: 'Keza', amanota: 40 } });
+    const before = readFileSync(file);
+
+    const rows = db.transaction((tx) => {
+      tx.add({ collection: 'abanyeshuri', data: { id: 1, izina: 'Aline', amanota: 88 } });
+      db.set({ collection: 'abanyeshuri', where: { id: 1 }, data: { amanota: 90 } });
+      tx.del({ collection: 'abanyeshuri', where: { id: 2 } });
+      expect(readFileSync(file)).toEqual(before);
+      expect(Database.open(file).get({ collection: 'abanyeshuri' })).toEqual([
+        { id: 2, izina: 'Keza', amanota: 40 },
+      ]);
+      return tx.get({ collection: 'abanyeshuri' });
+    });
+
+    expect(rows).toEqual([{ id: 1, izina: 'Aline', amanota: 90 }]);
+    expect(Database.open(file).get({ collection: 'abanyeshuri' })).toEqual([
+      { id: 1, izina: 'Aline', amanota: 90 },
+    ]);
+    expect(db.get({ collection: 'abanyeshuri' })).toEqual([
+      { id: 1, izina: 'Aline', amanota: 90 },
+    ]);
+  });
+
+  test('a failed callback restores memory and leaves the file untouched', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'ishuri.db');
+    const db = Database.open(file, { create: true });
+    db.execute('kora itsinda t shira muri t { id: 1, izina: "Aline" }');
+    const before = readFileSync(file);
+
+    expect(() =>
+      db.transaction((tx) => {
+        tx.add({ collection: 't', data: { id: 2, izina: 'Keza' } });
+        db.del({ collection: 't', where: { id: 9 } });
+      }),
+    ).toThrow(KinDbError);
+
+    expect(db.get({ collection: 't' })).toEqual([{ id: 1, izina: 'Aline' }]);
+    expect(readFileSync(file)).toEqual(before);
+    expect(Database.open(file).get({ collection: 't' })).toEqual([{ id: 1, izina: 'Aline' }]);
+  });
+
+  test('execute inside a transaction waits to write, and a caught failure keeps earlier rows', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'ishuri.db');
+    const db = Database.open(file, { create: true });
+    db.createCollection('t');
+    const before = readFileSync(file);
+
+    db.transaction((tx) => {
+      tx.add({ collection: 't', data: { id: 1 } });
+      expect(() => tx.execute('shira muri t { id: 2 } siba muri missing aho id = 1')).toThrow(
+        /was not found/,
+      );
+      expect(tx.get({ collection: 't' })).toEqual([{ id: 1 }]);
+      expect(readFileSync(file)).toEqual(before);
+    });
+
+    expect(Database.open(file).get({ collection: 't' })).toEqual([{ id: 1 }]);
+  });
+
+  test('a nested transaction rolls back only its own changes when the error is caught', () => {
+    const db = Database.memory();
+    db.createCollection('t');
+    const kept = db.transaction((tx) => {
+      tx.add({ collection: 't', data: { id: 1 } });
+      expect(() =>
+        tx.transaction((inner) => {
+          inner.add({ collection: 't', data: { id: 2 } });
+          throw new Error('stop');
+        }),
+      ).toThrow('stop');
+      return tx.get({ collection: 't' });
+    });
+    expect(kept).toEqual([{ id: 1 }]);
+    expect(db.get({ collection: 't' })).toEqual([{ id: 1 }]);
+  });
+
+  test('save inside a transaction is rejected and writes nothing', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'ishuri.db');
+    const db = Database.open(file, { create: true });
+    db.createCollection('t');
+    const before = readFileSync(file);
+    let code = '';
+    try {
+      db.transaction((tx) => {
+        tx.add({ collection: 't', data: { id: 1 } });
+        db.save();
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(KinDbError);
+      code = (error as KinDbError).code;
+    }
+    expect(code).toBe('E_TRANSACTION');
+    expect(db.get({ collection: 't' })).toEqual([]);
+    expect(readFileSync(file)).toEqual(before);
+  });
+
+  test('a returned promise is rejected and the changes are rolled back', () => {
+    const db = Database.memory();
+    db.createCollection('t');
+    let code = '';
+    try {
+      db.transaction(async (tx) => {
+        tx.add({ collection: 't', data: { id: 1 } });
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(KinDbError);
+      code = (error as KinDbError).code;
+    }
+    expect(code).toBe('E_TRANSACTION');
+    expect(db.get({ collection: 't' })).toEqual([]);
+  });
+
+  test('transaction() rejects a value that is not a function', () => {
+    const db = Database.memory();
+    expect(() => db.transaction(undefined as unknown as () => void)).toThrow(/expects a function/);
+  });
+});
+
 function range(start: number, end: number): number[] {
   const values: number[] = [];
   for (let value = start; value <= end; value += 1) values.push(value);

@@ -1,6 +1,6 @@
 export { KinDbError, isKinDbError } from './errors';
 export { Database } from './database';
-export type { OpenOptions, RunFileOptions } from './database';
+export type { OpenOptions, RunFileOptions, Transaction } from './database';
 export { executeSource, executeStatements } from './execute';
 export type { ExecuteResult } from './execute';
 export { parse } from './parser/parser';
