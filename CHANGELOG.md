@@ -23,6 +23,8 @@ Nothing was published before 0.1.0, so the notes below are the whole history of 
 
 ## [Unreleased]
 
+- `3071c15` Journal saves, bound queries, and the type graph check
+
 ## [0.1.0] - 2026-10-11
 
 ### Added
