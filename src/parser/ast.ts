@@ -6,6 +6,21 @@ export interface ColumnRef {
   name: string;
 }
 
+export type AggregateFn = 'count' | 'sum' | 'min' | 'max';
+
+export interface AggregateRef {
+  kind: 'aggregate';
+  fn: AggregateFn;
+  column: '*' | ColumnRef;
+}
+
+export type SelectItem = ColumnRef | AggregateRef;
+
+export interface OrderKey {
+  item: ColumnRef | AggregateRef;
+  direction: 'asc' | 'desc';
+}
+
 export interface TableRef {
   name: string;
   alias?: string;
@@ -22,9 +37,11 @@ export type Statement =
   | { kind: 'delete'; collection: string; where: Predicate[] }
   | {
       kind: 'select';
-      columns: '*' | ColumnRef[];
+      columns: '*' | SelectItem[];
       from: TableRef[];
       where: Predicate[];
+      group?: ColumnRef[];
+      order?: OrderKey[];
       limit?: number;
     };
 

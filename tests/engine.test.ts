@@ -99,16 +99,19 @@ describe('Kinyarwanda SQL', () => {
     db.execute(`
       kora itsinda t
       shira muri t { id: 1 }
-      shira muri t { id: 2 }
+      shira muri t { id: 2, izina: "Aline" }
       shira muri t { id: 3 }
     `);
     expect(db.query('hitamo id, izina muri t imipaka 2')).toEqual([
       { id: 1, izina: null },
-      { id: 2, izina: null },
+      { id: 2, izina: 'Aline' },
     ]);
+    expect(() => db.query('hitamo nope muri t')).toThrow(/was not found/);
     expect(db.query('hitamo id muri t aho id > 1 imipaka 1')).toEqual([{ id: 2 }]);
     expect(db.query('hitamo * muri t imipaka 0')).toEqual([]);
-    expect(db.get({ collection: 't', where: { id: { gt: 1 } }, limit: 1 })).toEqual([{ id: 2 }]);
+    expect(db.get({ collection: 't', where: { id: { gt: 1 } }, limit: 1 })).toEqual([
+      { id: 2, izina: 'Aline' },
+    ]);
   });
 
   test('deletes every match and refuses an empty where', () => {
@@ -208,7 +211,10 @@ describe('.db and .kindb files', () => {
     expect(fromJsonBase.get({ collection: 'users', where: { username: 'leerob' } })).toEqual([
       { id: '1', username: 'leerob' },
     ]);
+    const legacyBytes = readFileSync(legacy);
     fromJsonBase.execute('hitamo id muri users');
+    expect(readFileSync(legacy)).toEqual(legacyBytes);
+    fromJsonBase.save();
     expect(readFileSync(legacy).subarray(0, 13).toString('utf8')).toBe('KinDB page v1');
     expect(Database.open(legacy).get({ collection: 'users' })[0].id).toBe('1');
   });

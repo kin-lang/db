@@ -34,6 +34,17 @@ export function scanUntil(
   walkUntil(pager, root, visit);
 }
 
+/** Largest row id in the table, or 0 when it has no rows. Walks only the right edge. */
+export function highestRowid(pager: Pager, root: number): number {
+  let pageNumber = root;
+  while (pager.get(pageNumber).readUInt8(0) === PAGE_INTERIOR) {
+    pageNumber = readInterior(pager.get(pageNumber)).right;
+  }
+  const cells = readLeaf(pager.get(pageNumber));
+  if (cells.length === 0) return 0;
+  return cells[cells.length - 1].rowid;
+}
+
 /** In-order scan of a table btree. */
 export function scanTree(pager: Pager, root: number): StoredRecord[] {
   const found: StoredRecord[] = [];

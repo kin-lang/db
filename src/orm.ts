@@ -1,8 +1,14 @@
 import type { Transaction } from './database';
 import { KinDbError } from './errors';
-import { assertValueType, type ColumnDef } from './pager/record';
 import {
-  assertCollectionName,
+  assertValueType,
+  COLUMN_TYPES,
+  columnTypeFromName,
+  type ColumnDef,
+  type FieldKind,
+} from './pager/record';
+import { assertSqlName } from './sql';
+import {
   assertRow,
   type FieldFilter,
   type JsonValue,
@@ -10,23 +16,7 @@ import {
   type Where,
 } from './value';
 
-/**
- * Column types accepted by {@link model}.
- * `umubare`, `ijambo`, `ukuri`, and `ikintu` are the Kinyarwanda names
- * used by `kora itsinda` and by Kin's `icyitegererezo`.
- */
-const FIELD_TYPE = {
-  number: 'number',
-  umubare: 'number',
-  string: 'string',
-  ijambo: 'string',
-  boolean: 'boolean',
-  ukuri: 'boolean',
-  any: 'any',
-  ikintu: 'any',
-} as const;
-
-export type FieldKind = keyof typeof FIELD_TYPE;
+export type { FieldKind };
 
 /** A collection's fields: each name maps to a {@link FieldKind}. */
 export type ModelFields = Record<string, FieldKind>;
@@ -39,7 +29,7 @@ type StoredValue = {
 };
 
 /** One field's stored value. `null` (`ubusa`) is allowed on every field. */
-export type FieldValue<K extends FieldKind> = StoredValue[(typeof FIELD_TYPE)[K]];
+export type FieldValue<K extends FieldKind> = StoredValue[(typeof COLUMN_TYPES)[K]];
 
 /** Columns written by {@link Repository.shira} and {@link Repository.hindura}. Every field is optional. */
 export type ModelRow<F extends ModelFields> = {
@@ -75,15 +65,13 @@ export interface Repository<F extends ModelFields> {
   siba(params: { where: ModelWhere<F> }): number;
 }
 
-const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
 /**
  * Describe one collection.
  * Call {@link Model.on} with a `Database` or a transaction, then
  * `kora`, `shira`, `hitamo`, `hindura`, and `siba` run on that session.
  */
 export function model<const F extends ModelFields>(collection: string, fields: F): Model<F> {
-  assertCollectionName(collection);
+  assertSqlName(collection, 'Collection name');
   const columns = normalizeColumns(collection, fields);
   return {
     collection,
@@ -108,21 +96,19 @@ function normalizeColumns(collection: string, fields: ModelFields): ColumnDef[] 
         `Field '${name}' on model '${collection}' has type '${String(raw)}', expected number, string, boolean, any, umubare, ijambo, ukuri, or ikintu`,
       );
     }
-    columns.push({ name, type: FIELD_TYPE[raw] });
+    columns.push({ name, type: columnTypeFromName(raw) });
   }
   return columns;
 }
 
 function isFieldKind(value: string): value is FieldKind {
-  return Object.prototype.hasOwnProperty.call(FIELD_TYPE, value);
+  return Object.prototype.hasOwnProperty.call(COLUMN_TYPES, value.toLowerCase());
 }
 
 function assertFieldName(collection: string, name: string): void {
-  if (!NAME_PATTERN.test(name)) {
-    throw new KinDbError(
-      'E_TYPE',
-      `Field '${name}' on model '${collection}' must be a letter or underscore followed by letters, digits, or underscores`,
-    );
+  assertSqlName(name, 'Field');
+  if (!collection) {
+    throw new KinDbError('E_TYPE', 'model() needs a collection name');
   }
 }
 

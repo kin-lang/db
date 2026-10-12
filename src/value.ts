@@ -48,13 +48,64 @@ const OPERATOR_ALIAS: Record<string, CompareOp> = {
 
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-export function assertCollectionName(name: string): void {
+/** `what` already includes the quoted name, for example `Collection name 'abanyeshuri'`. */
+export function assertIdentifier(name: string, what: string): void {
   if (!NAME_PATTERN.test(name)) {
     throw new KinDbError(
       'E_TYPE',
-      `Collection name '${name}' must be a letter or underscore followed by letters, digits, or underscores`,
+      `${what} '${name}' must be a letter or underscore followed by letters, digits, or underscores`,
     );
   }
+}
+
+export function assertCollectionName(name: string): void {
+  assertIdentifier(name, 'Collection name');
+}
+
+export function assertLimit(limit: number | undefined): void {
+  if (limit === undefined) return;
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new KinDbError(
+      'E_TYPE',
+      'Limit must be a whole number, 0 or more. Example: imipaka 10',
+    );
+  }
+}
+
+/**
+ * Order used by TONDEKA.
+ * `ubusa` sorts after every value. Numbers, strings, and booleans stay in their own groups.
+ */
+export function orderValues(left: JsonValue | undefined, right: JsonValue | undefined): number {
+  const leftMissing = left === undefined || left === null;
+  const rightMissing = right === undefined || right === null;
+  if (leftMissing || rightMissing) {
+    if (leftMissing && rightMissing) return 0;
+    return leftMissing ? 1 : -1;
+  }
+  const leftRank = valueRank(left);
+  const rightRank = valueRank(right);
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
+  if (typeof left === 'number' && typeof right === 'number') {
+    if (left === right) return 0;
+    return left < right ? -1 : 1;
+  }
+  if (typeof left === 'string' && typeof right === 'string') {
+    if (left === right) return 0;
+    return left < right ? -1 : 1;
+  }
+  const leftText = JSON.stringify(left);
+  const rightText = JSON.stringify(right);
+  if (leftText === rightText) return 0;
+  return leftText < rightText ? -1 : 1;
+}
+
+function valueRank(value: JsonValue): number {
+  if (typeof value === 'boolean') return 1;
+  if (typeof value === 'number') return 2;
+  if (typeof value === 'string') return 3;
+  return 4;
 }
 
 export function cloneJson<T extends JsonValue>(value: T): T {
@@ -73,8 +124,8 @@ export function cloneJson<T extends JsonValue>(value: T): T {
  * Returns null when the value cannot match anything.
  */
 export function looseBucket(value: JsonValue | undefined): string | null {
-  if (value === undefined) return null;
-  if (value === null) return 'null';
+  // `ubusa` matches a literal in WHERE. It does not match another row in a join.
+  if (value === undefined || value === null) return null;
   if (typeof value === 'boolean') return value ? 'b:1' : 'b:0';
   if (typeof value === 'number') return `n:${value}`;
   if (typeof value === 'string') {
@@ -173,9 +224,7 @@ export function matches(row: Row, predicates: Predicate[]): boolean {
 export function whereToPredicates(where: Where): Predicate[] {
   const predicates: Predicate[] = [];
   for (const [field, filter] of Object.entries(where)) {
-    if (!NAME_PATTERN.test(field)) {
-      throw new KinDbError('E_TYPE', `Field name '${field}' is not a valid identifier`);
-    }
+    assertIdentifier(field, 'Field name');
     if (filter !== null && typeof filter === 'object' && !Array.isArray(filter)) {
       const entries = Object.entries(filter);
       if (entries.length === 0) {
@@ -184,7 +233,10 @@ export function whereToPredicates(where: Where): Predicate[] {
       for (const [operator, raw] of entries) {
         const op = OPERATOR_ALIAS[operator];
         if (!op) {
-          throw new KinDbError('E_OPERATOR', `Operator '${operator}' is not supported`);
+          throw new KinDbError(
+            'E_OPERATOR',
+            `Operator '${operator}' is not supported. Use lt, lte, gt, gte, eq, munsi, munsi_cyangwa, hejuru, hejuru_cyangwa, or ni.`,
+          );
         }
         if (typeof raw !== 'number' || !Number.isFinite(raw)) {
           throw new KinDbError(

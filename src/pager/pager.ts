@@ -1,13 +1,17 @@
-import { closeSync, existsSync, openSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { commitPages } from './journal';
 import { KinDbError } from '../errors';
 import {
   blankLeaf,
+  checksumOf,
   emptyHeader,
   freelistCapacity,
   MAGIC,
   PAGE_SIZE,
+  pageDigest,
   readFreelist,
   readHeader,
+  readStoredChecksum,
+  stampChecksum,
   writeFreelist,
   writeHeader,
   type FileHeader,
@@ -25,18 +29,60 @@ export class Pager {
   private dirty: Set<number>;
   /** Header fields changed since page 1 was last rebuilt. */
   private headerDirty: boolean;
+  /** changeCounter last read from disk, or written by this pager. */
+  private baseCounter: number;
+  /**
+   * Smallest row id in each index page's subtree.
+   * It is not stored in the file. A snapshot copies it so a rollback
+   * restores the same answers the pages describe.
+   */
+  private indexMins: Map<number, number>;
+  /**
+   * Number of index entries in each page's subtree.
+   * Same lifetime as {@link indexMins}: memory only, copied by a snapshot.
+   */
+  private indexCounts: Map<number, number>;
+  /** Per-page digests for the header checksum. A snapshot copies the array. */
+  private digests: number[];
+  private digestXor: number;
 
-  private constructor(pages: Buffer[], header: FileHeader, dirty: Set<number>, headerDirty: boolean) {
+  private constructor(
+    pages: Buffer[],
+    header: FileHeader,
+    dirty: Set<number>,
+    headerDirty: boolean,
+    baseCounter: number,
+    indexMins: Map<number, number>,
+    indexCounts: Map<number, number>,
+    digests: number[] | null,
+  ) {
     this.pages = pages;
     this.header = header;
     this.dirty = dirty;
     this.headerDirty = headerDirty;
+    this.baseCounter = baseCounter;
+    this.indexMins = indexMins;
+    this.indexCounts = indexCounts;
+    this.digests =
+      digests && digests.length === pages.length
+        ? digests
+        : pages.map((page, index) => pageDigest(page, index === 0));
+    this.digestXor = checksumOf(this.digests);
   }
 
   static create(): Pager {
     const pages = [Buffer.alloc(PAGE_SIZE), blankLeaf()];
     const header = emptyHeader(pages.length);
-    const pager = new Pager(pages, header, new Set([1, 2]), true);
+    const pager = new Pager(
+      pages,
+      header,
+      new Set([1, 2]),
+      true,
+      header.changeCounter,
+      new Map(),
+      new Map(),
+      null,
+    );
     pager.syncHeader();
     return pager;
   }
@@ -60,10 +106,20 @@ export class Pager {
       throw new KinDbError('E_IO', 'Database header page count does not match the file');
     }
     const pages: Buffer[] = [];
+    const digests: number[] = [];
     for (let i = 0; i < pageCount; i += 1) {
-      pages.push(Buffer.from(bytes.subarray(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)));
+      const page = Buffer.from(bytes.subarray(i * PAGE_SIZE, (i + 1) * PAGE_SIZE));
+      pages.push(page);
+      digests.push(pageDigest(page, i === 0));
     }
-    return new Pager(pages, header, new Set(), false);
+    const expected = readStoredChecksum(pages[0]);
+    if (expected !== null && expected !== checksumOf(digests)) {
+      throw new KinDbError(
+        'E_IO',
+        'This database file does not match the last save. KinDB did not open it. Restore a backup, then try again.',
+      );
+    }
+    return new Pager(pages, header, new Set(), false, header.changeCounter, new Map(), new Map(), digests);
   }
 
   /**
@@ -72,7 +128,16 @@ export class Pager {
    */
   snapshot(): Pager {
     this.syncHeader();
-    return new Pager(this.pages.slice(), { ...this.header }, new Set(this.dirty), false);
+    return new Pager(
+      this.pages.slice(),
+      { ...this.header },
+      new Set(this.dirty),
+      false,
+      this.baseCounter,
+      new Map(this.indexMins),
+      new Map(this.indexCounts),
+      this.digests.slice(),
+    );
   }
 
   get pageCount(): number {
@@ -113,6 +178,7 @@ export class Pager {
       throw new KinDbError('E_IO', 'A page write must be the fixed page size');
     }
     this.pages[pageNumber - 1] = page;
+    this.replaceDigest(pageNumber, page);
     this.dirty.add(pageNumber);
     this.touch();
   }
@@ -120,7 +186,10 @@ export class Pager {
   /** Take a page from the freelist, or append a new page at the end of the file. */
   allocate(): number {
     if (this.header.freelistHead === 0) {
-      this.pages.push(Buffer.alloc(PAGE_SIZE));
+      const page = Buffer.alloc(PAGE_SIZE);
+      this.pages.push(page);
+      this.digests.push(0);
+      this.replaceDigest(this.pages.length, page);
       this.header.pageCount = this.pages.length;
       this.dirty.add(this.pages.length);
       this.touch();
@@ -141,9 +210,41 @@ export class Pager {
     return trunkNumber;
   }
 
+  /** Smallest row id cached for an index page, if this pager has computed one. */
+  indexMinOf(pageNumber: number): number | undefined {
+    return this.indexMins.get(pageNumber);
+  }
+
+  /** Record the smallest row id in an index page's subtree. */
+  setIndexMin(pageNumber: number, min: number): void {
+    this.indexMins.set(pageNumber, min);
+  }
+
+  /** Drop a cached index minimum. A freed page must not keep the old row id. */
+  clearIndexMin(pageNumber: number): void {
+    this.indexMins.delete(pageNumber);
+  }
+
+  /** Entries cached for an index page, if this pager has computed the subtree. */
+  indexCountOf(pageNumber: number): number | undefined {
+    return this.indexCounts.get(pageNumber);
+  }
+
+  /** Record how many index entries sit in this page's subtree. */
+  setIndexCount(pageNumber: number, count: number): void {
+    this.indexCounts.set(pageNumber, count);
+  }
+
+  /** Drop a cached entry count. A freed page must not answer for its old tree. */
+  clearIndexCount(pageNumber: number): void {
+    this.indexCounts.delete(pageNumber);
+  }
+
   /** Return a page to the freelist trunk chain. */
   free(pageNumber: number): void {
     this.assertPage(pageNumber);
+    this.indexMins.delete(pageNumber);
+    this.indexCounts.delete(pageNumber);
     if (pageNumber === 1) throw new KinDbError('E_IO', 'Page 1 cannot be freed');
     const capacity = freelistCapacity();
     if (this.header.freelistHead === 0) {
@@ -176,32 +277,12 @@ export class Pager {
    * Write dirty pages in place.
    * The whole file is written when `full` is set, when the path is new,
    * or when the existing bytes are not a page file of this length or shorter.
+   * A file another session has already grown or committed is left untouched.
    */
   writeTo(filePath: string, full: boolean): void {
     this.syncHeader();
-    const bytes = this.pages.length * PAGE_SIZE;
-    if (full || !existsSync(filePath)) {
-      this.writeAll(filePath);
-      return;
-    }
-    const size = statSync(filePath).size;
-    if (this.dirty.size === 0 && size === bytes) return;
-    if (size % PAGE_SIZE !== 0 || size > bytes || !hasPageMagic(filePath, size)) {
-      this.writeAll(filePath);
-      return;
-    }
-    const fd = openSync(filePath, 'r+');
-    try {
-      const firstMissing = size / PAGE_SIZE + 1;
-      for (let pageNumber = firstMissing; pageNumber <= this.pages.length; pageNumber += 1) {
-        this.dirty.add(pageNumber);
-      }
-      for (const pageNumber of this.dirty) {
-        writeSync(fd, this.pages[pageNumber - 1], 0, PAGE_SIZE, (pageNumber - 1) * PAGE_SIZE);
-      }
-    } finally {
-      closeSync(fd);
-    }
+    commitPages(filePath, this.pages, this.dirty, full, this.baseCounter);
+    this.baseCounter = this.header.changeCounter;
     this.dirty.clear();
   }
 
@@ -209,19 +290,26 @@ export class Pager {
     return this.snapshot();
   }
 
-  private writeAll(filePath: string): void {
-    writeFileSync(filePath, Buffer.concat(this.pages));
-    this.dirty.clear();
-  }
-
   private syncHeader(): void {
     if (!this.headerDirty) return;
     this.header.pageCount = this.pages.length;
     const page = Buffer.from(this.pages[0]);
     writeHeader(page, this.header);
+    this.replaceDigest(1, page);
+    stampChecksum(page, this.digestXor);
     this.pages[0] = page;
     this.dirty.add(1);
     this.headerDirty = false;
+  }
+
+  /** Keep the running XOR equal to the digest of `page`. Page 1 ignores its checksum field. */
+  private replaceDigest(pageNumber: number, page: Buffer): void {
+    const next = pageDigest(page, pageNumber === 1);
+    const index = pageNumber - 1;
+    const prev = this.digests[index] ?? 0;
+    if (index === this.digests.length) this.digests.push(prev);
+    this.digests[index] = next;
+    this.digestXor = (this.digestXor ^ prev ^ next) >>> 0;
   }
 
   private touch(): void {
@@ -237,14 +325,4 @@ export class Pager {
   }
 }
 
-function hasPageMagic(filePath: string, size: number): boolean {
-  if (size < MAGIC.length) return false;
-  const fd = openSync(filePath, 'r');
-  try {
-    const magic = Buffer.alloc(MAGIC.length);
-    const read = readSync(fd, magic, 0, MAGIC.length, 0);
-    return read === MAGIC.length && magic.equals(MAGIC);
-  } finally {
-    closeSync(fd);
-  }
-}
+

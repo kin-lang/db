@@ -19,6 +19,18 @@ export function isNumberKey(key: Buffer): boolean {
   return key[0] === TAG_NUMBER;
 }
 
+/** Inverse of the numeric index key. Returns null when `key` is not a number. */
+export function decodeNumberKey(key: Buffer): number | null {
+  if (key.length !== 9 || key[0] !== TAG_NUMBER) return null;
+  const raw = Buffer.from(key.subarray(1, 9));
+  if (raw[0] & 0x80) raw[0] &= 0x7f;
+  else {
+    for (let i = 0; i < 8; i += 1) raw[i] ^= 0xff;
+  }
+  const value = raw.readDoubleBE(0);
+  return Number.isFinite(value) ? value : null;
+}
+
 /**
  * Orderable bytes for one indexed value.
  * Numbers and numeric strings share a key, including `"-0"` and `"1.0"`,
@@ -70,6 +82,20 @@ export function rangeHigh(value: number, inclusive: boolean): Bound {
   const key = encodeNumber(value === 0 ? 0 : value);
   if (inclusive) return { key, rowid: MAX_ROWID, inclusive: true };
   return { key, rowid: 0, inclusive: false };
+}
+
+/**
+ * A numeric comparison stays inside number keys.
+ * An open end must not continue into strings, and an open start must not
+ * include null or booleans, which sort before every number.
+ */
+export function numberDomainLow(): Bound {
+  return rangeLow(-Number.MAX_VALUE, true);
+}
+
+/** Last finite number key. Strings sort after this bound. */
+export function numberDomainHigh(): Bound {
+  return rangeHigh(Number.MAX_VALUE, true);
 }
 
 /**

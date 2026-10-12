@@ -66,6 +66,10 @@ export function tokenize(source: string): Token[] {
       tokens.push(scanString(char, startLine, startColumn));
       continue;
     }
+    if (char === '$') {
+      tokens.push(scanParam(startLine, startColumn));
+      continue;
+    }
     if (isDigit(char)) {
       tokens.push(scanNumber(startLine, startColumn));
       continue;
@@ -75,6 +79,25 @@ export function tokenize(source: string): Token[] {
       continue;
     }
 
+    if (char === '!') {
+      const op = peek(1) === '=' ? '!=' : '!';
+      throw new KinDbError(
+        'E_SYNTAX',
+        `KinDB has no '${op}' at ${startLine}:${startColumn}. Compare with =, <, >, <=, >=, or ni. Example: aho id = 1`,
+      );
+    }
+    if (char === '+') {
+      throw new KinDbError(
+        'E_SYNTAX',
+        `KinDB has no '+' at ${startLine}:${startColumn}. Add numbers in your program, then pass the result with $name.`,
+      );
+    }
+    if (char === '|') {
+      throw new KinDbError(
+        'E_SYNTAX',
+        `KinDB has no '|' at ${startLine}:${startColumn}. Combine conditions with KANDI. Example: aho id = 1 kandi yize = nibyo`,
+      );
+    }
     const two = char + peek(1);
     const type = SYMBOLS[two] ?? SYMBOLS[char];
     if (!type) {
@@ -98,7 +121,11 @@ export function tokenize(source: string): Token[] {
     while (index < source.length && peek() !== quote) {
       const current = advance();
       if (current === '\n') {
-        throw new KinDbError('E_SYNTAX', `Unterminated string at ${startLine}:${startColumn}`);
+        throw new KinDbError(
+          'E_SYNTAX',
+          `Unterminated string at ${startLine}:${startColumn}. Close it with ${quote}, or pass the text as $name.`,
+          true,
+        );
       }
       if (current !== '\\') {
         value += current;
@@ -108,16 +135,36 @@ export function tokenize(source: string): Token[] {
       if (!(escaped in ESCAPES)) {
         throw new KinDbError(
           'E_SYNTAX',
-          `Unknown string escape '\\${escaped}' at ${line}:${column}`,
+          `Unknown string escape '\\${escaped}' at ${line}:${column}. A string escape is \\\\, \\", \\', \\n, \\t, or \\r.`,
         );
       }
       value += ESCAPES[escaped];
     }
     if (peek() !== quote) {
-      throw new KinDbError('E_SYNTAX', `Unterminated string at ${startLine}:${startColumn}`);
+      throw new KinDbError(
+        'E_SYNTAX',
+        `Unterminated string at ${startLine}:${startColumn}. Close it with ${quote}, or pass the text as $name.`,
+        true,
+      );
     }
     advance();
     return { type: 'string', lexeme: value, value, line: startLine, column: startColumn };
+  }
+
+  function scanParam(startLine: number, startColumn: number): Token {
+    advance();
+    if (!isIdentStart(peek())) {
+      throw new KinDbError(
+        'E_SYNTAX',
+        `Expected a name after '$' at ${startLine}:${startColumn}. Example: hitamo * muri t aho izina = $izina`,
+        true,
+      );
+    }
+    const start = index;
+    advance();
+    while (isIdentPart(peek())) advance();
+    const name = source.slice(start, index);
+    return { type: 'param', lexeme: name, value: name, line: startLine, column: startColumn };
   }
 
   function scanNumber(startLine: number, startColumn: number): Token {

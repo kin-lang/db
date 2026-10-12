@@ -1,11 +1,13 @@
 import { KinDbError } from '../errors';
 import { encodeIndexKey, type Bound } from '../pager/index-key';
-import type { ColumnRef, TableRef } from '../parser/ast';
+import type { AggregateRef, ColumnRef, OrderKey, SelectItem, TableRef } from '../parser/ast';
 import {
+  assertLimit,
   cloneJson,
   looseBucket,
   looseEqual,
   compare,
+  orderValues,
   type JsonValue,
   type Predicate,
   type Row,
@@ -38,26 +40,50 @@ export interface InputRelation {
     high: Bound | null,
     visit: (row: Row, rowid: number) => boolean,
   ): void;
+  /**
+   * Rows in stored order. `limit` lets a wide read stop.
+   * `visit` returns false to stop.
+   */
+  read(
+    predicates: Predicate[],
+    limit: number | undefined,
+    visit: (row: Row, rowid: number) => boolean,
+  ): void;
+  /**
+   * Rows in `tondeka` order when the indexed column is a number or a boolean.
+   * Returns false when the caller should filter and sort instead.
+   * `visit` returns false to stop.
+   */
+  readOrdered?(
+    predicates: Predicate[],
+    column: string,
+    direction: 'asc' | 'desc',
+    limit: number,
+    visit: (row: Row) => boolean,
+  ): boolean;
 }
 
 /**
  * Run a select as relational operators only:
  * selection on each input, theta-join for `huza`, then selection of whatever
  * predicate still crosses the result, then projection and limit.
- * A point or a bounded range uses an index when one exists. An equality join
- * probes the inner index when the query has a limit or the outer side is an
- * equality; otherwise it is hashed. A limit stops once enough rows match.
+ * A point or a bounded range uses an index when one exists. The smaller
+ * index wins when two columns are both indexed. An equality join probes
+ * the inner index when that side has one. When only the outer table has
+ * the index, a limit walks the inner table and probes the outer index.
+ * `tondeka` with `imipaka` on an indexed number or boolean reads only
+ * enough rows to fill the limit.
  */
 export function evaluateSelect(
   inputs: InputRelation[],
   where: Predicate[],
-  columns: '*' | ColumnRef[],
+  columns: '*' | SelectItem[],
   limit?: number,
+  group?: ColumnRef[],
+  order?: OrderKey[],
 ): Row[] {
   if (inputs.length === 0) return [];
-  if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
-    throw new KinDbError('E_TYPE', 'Limit must be a non-negative integer');
-  }
+  assertLimit(limit);
   const seen = new Set<string>();
   for (const input of inputs) {
     const name = input.ref.alias ?? input.ref.name;
@@ -69,33 +95,40 @@ export function evaluateSelect(
     }
     seen.add(name);
   }
-  for (const predicate of where) {
-    for (const column of referenced(predicate)) {
-      if (column.qualifier) continue;
-      const owners = inputs.filter((input) => input.columns.includes(column.field));
-      if (owners.length > 1) {
-        throw new KinDbError('E_TYPE', `Column '${column.field}' is ambiguous`);
-      }
-    }
-  }
+  assertKnownColumns(inputs, mentionedColumns(where, columns, group, order));
   if (limit === 0) return [];
-  if (inputs.length === 1) {
+  const shaping = needsShape(columns, group, order);
+  if (inputs.length === 1 && !shaping) {
     const rows: Row[] = [];
-    streamBase(inputs[0], where, (scope) => {
+    streamBase(inputs[0], where, limit, (scope) => {
       rows.push(projectScope(scope, columns));
       return limit === undefined || rows.length < limit;
     });
     return rows;
   }
+  if (inputs.length === 1 && shaping && limit !== undefined) {
+    const ordered = takeOrdered(inputs[0], where, columns, order, group, limit);
+    if (ordered) return ordered;
+  }
+  if (inputs.length === 1) {
+    const scopes: Scope[] = [];
+    streamBase(inputs[0], where, undefined, (scope) => {
+      scopes.push(scope);
+      return true;
+    });
+    return finishScopes(scopes, columns, group, order, limit);
+  }
 
   const pending = [...where];
   const residual = take(pending, (predicate) => !attached(predicate, inputs));
   const scopes: Scope[] = [];
-  produce(inputs, pending, residual, inputs.length - 1, limit, limit !== undefined, (scope) => {
+  const stoppable = !shaping && limit !== undefined;
+  produce(inputs, pending, residual, inputs.length - 1, shaping ? undefined : limit, stoppable, (scope) => {
     scopes.push(scope);
-    return limit === undefined || scopes.length < limit;
+    return shaping || limit === undefined || scopes.length < limit;
   });
-  return project(scopes, columns);
+  if (!shaping) return project(scopes, columns);
+  return finishScopes(scopes, columns, group, order, limit);
 }
 
 /** σ — keep tuples that match every predicate. */
@@ -108,41 +141,22 @@ export function join(left: Scope[], right: Scope[], predicates: Predicate[]): Sc
   return produceJoin(left, right, predicates, [], undefined);
 }
 
-export function project(scopes: Scope[], columns: '*' | ColumnRef[]): Row[] {
+export function project(scopes: Scope[], columns: '*' | SelectItem[]): Row[] {
   return scopes.map((scope) => projectScope(scope, columns));
 }
 
 function streamBase(
   input: InputRelation,
   predicates: Predicate[],
+  limit: number | undefined,
   onScope: (scope: Scope) => boolean,
 ): void {
   const name = qualifierOf(input);
-  const access = planRead(predicates, input.indexed, name);
-  const emit = (row: Row): boolean => {
+  input.read(predicates, limit, (row) => {
     const scope: Scope = { row, sources: { [name]: row }, primary: name };
     if (!predicates.every((predicate) => holds(scope, predicate))) return true;
     return onScope(scope);
-  };
-  if (access.kind === 'empty') return;
-  if (access.kind === 'point') {
-    input.probe(access.column, access.key, emit);
-    return;
-  }
-  if (access.kind === 'range') {
-    // Index order is not table order. Sort by row id, then recheck.
-    const hits: { row: Row; rowid: number }[] = [];
-    input.range(access.column, access.low, access.high, (row, rowid) => {
-      hits.push({ row, rowid });
-      return true;
-    });
-    hits.sort((a, b) => a.rowid - b.rowid);
-    for (const hit of hits) {
-      if (!emit(hit.row)) return;
-    }
-    return;
-  }
-  input.forEach(emit);
+  });
 }
 
 function produce(
@@ -155,7 +169,7 @@ function produce(
   onScope: (scope: Scope) => boolean,
 ): void {
   if (end === 0) {
-    streamBase(inputs[0], take(pending, (predicate) => covers(predicate, inputs[0])), onScope);
+    streamBase(inputs[0], take(pending, (predicate) => covers(predicate, inputs[0])), undefined, onScope);
     return;
   }
   const right = inputs[end];
@@ -177,13 +191,26 @@ function produce(
     );
     return;
   }
+  // The index is on the original left table. Walk the right table in stored
+  // order and probe that index, so `imipaka 1` does not read both tables.
+  // The merged row still names the original left table as the primary.
+  if (stoppable && leftInputs.length === 1) {
+    const swapped = indexLink(joinOn, [right], leftInputs[0]);
+    if (swapped) {
+      const leftPreds = take(pending, (predicate) => covers(predicate, leftInputs[0]));
+      streamBase(right, rightPreds, undefined, (outerScope) =>
+        probeFromOuter(outerScope, leftInputs[0], leftPreds, joinOn, swapped, extras, onScope),
+      );
+      return;
+    }
+  }
   const leftScopes: Scope[] = [];
   produce(inputs, pending, residual, end - 1, undefined, false, (scope) => {
     leftScopes.push(scope);
     return true;
   });
   const rightScopes: Scope[] = [];
-  streamBase(right, rightPreds, (scope) => {
+  streamBase(right, rightPreds, undefined, (scope) => {
     rightScopes.push(scope);
     return true;
   });
@@ -209,8 +236,7 @@ function probeRight(
   onScope: (scope: Scope) => boolean,
 ): boolean {
   const raw = readColumn(leftScope, link.leftQualifier, link.leftField);
-  if (raw === undefined) return true;
-  if (link.op === 'eq' && typeof raw !== 'number') return true;
+  if (raw === undefined || raw === null || typeof raw === 'object') return true;
   const key = encodeIndexKey(raw);
   if (!key) return true;
   const name = qualifierOf(right);
@@ -230,6 +256,66 @@ function probeRight(
     return keep;
   });
   return keep;
+}
+
+function probeFromOuter(
+  outerScope: Scope,
+  inner: InputRelation,
+  innerPreds: Predicate[],
+  joinOn: Predicate[],
+  link: EquiLink,
+  residual: Predicate[],
+  onScope: (scope: Scope) => boolean,
+): boolean {
+  const raw = readColumn(outerScope, link.leftQualifier, link.leftField);
+  if (raw === undefined || raw === null || typeof raw === 'object') return true;
+  const key = encodeIndexKey(raw);
+  if (!key) return true;
+  const innerName = qualifierOf(inner);
+  const outerName = outerScope.primary;
+  let keep = true;
+  inner.probe(link.rightField, key, (row) => {
+    const innerScope: Scope = { row, sources: { [innerName]: row }, primary: innerName };
+    if (!innerPreds.every((predicate) => holds(innerScope, predicate))) return true;
+    const sources = { ...innerScope.sources, ...outerScope.sources };
+    const preview: Scope = { row, sources, primary: innerName };
+    if (!joinOn.every((predicate) => holds(preview, predicate))) return true;
+    if (!residual.every((predicate) => holds(preview, predicate))) return true;
+    keep = onScope({
+      row: mergeRows(row, outerScope.row, innerName, outerName),
+      sources,
+      primary: innerName,
+    });
+    return keep;
+  });
+  return keep;
+}
+
+function takeOrdered(
+  input: InputRelation,
+  where: Predicate[],
+  columns: '*' | SelectItem[],
+  order: OrderKey[] | undefined,
+  group: ColumnRef[] | undefined,
+  limit: number,
+): Row[] | null {
+  if (group && group.length > 0) return null;
+  if (columns !== '*' && columns.some(isAggregate)) return null;
+  if (!order || order.length !== 1 || !input.readOrdered) return null;
+  const key = order[0];
+  if (isAggregate(key.item)) return null;
+  const name = qualifierOf(input);
+  if (key.item.qualifier && key.item.qualifier !== name) return null;
+  if (!input.indexed.includes(key.item.name)) return null;
+  const rows: Row[] = [];
+  const handled = input.readOrdered(where, key.item.name, key.direction, limit, (row) => {
+    const scope: Scope = { row, sources: { [name]: row }, primary: name };
+    if (!where.every((predicate) => holds(scope, predicate))) return true;
+    rows.push(projectScope(scope, columns));
+    return rows.length < limit;
+  });
+  if (!handled) return null;
+  return rows;
 }
 
 function indexLink(
@@ -435,7 +521,7 @@ function equiKey(scope: Scope, links: EquiLink[], side: 'left' | 'right'): strin
       side === 'left' ? link.leftQualifier : link.rightQualifier,
       side === 'left' ? link.leftField : link.rightField,
     );
-    const part = link.op === 'eq' ? (typeof value === 'number' ? `e:${value}` : null) : looseBucket(value);
+    const part = link.op === 'eq' ? strictPart(value) : looseBucket(value);
     if (part === null) return null;
     key += `${part}\0`;
   }
@@ -445,16 +531,32 @@ function equiKey(scope: Scope, links: EquiLink[], side: 'left' | 'right'): strin
 function holdsEqui(scope: Scope, link: EquiLink): boolean {
   const left = readColumn(scope, link.leftQualifier, link.leftField);
   const right = readColumn(scope, link.rightQualifier, link.rightField);
-  if (link.op === 'loose') return looseEqual(left, right ?? null);
-  return typeof left === 'number' && left === right;
+  if (left === undefined || left === null || right === undefined || right === null) return false;
+  if (link.op === 'loose') return looseEqual(left, right);
+  return left === right;
 }
 
-function projectScope(scope: Scope, columns: '*' | ColumnRef[]): Row {
+function strictPart(value: JsonValue | undefined): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') return `n:${value === 0 ? 0 : value}`;
+  if (typeof value === 'string') return `s:${value}`;
+  if (typeof value === 'boolean') return value ? 'b:1' : 'b:0';
+  return null;
+}
+
+function projectScope(scope: Scope, columns: '*' | SelectItem[]): Row {
   if (columns === '*') return cloneJson(scope.row);
-  const names = columns.map((column) => column.name);
+  const plain = columns.filter((column): column is ColumnRef => !isAggregate(column));
+  if (plain.length !== columns.length) {
+    throw new KinDbError(
+      'E_TYPE',
+      'BARA, TERANYA, NTO, and NINI count rows for a group. Example: hitamo ishuri, bara(*) muri abanyeshuri koranya ishuri',
+    );
+  }
+  const names = plain.map((column) => column.name);
   const duplicated = new Set(names.filter((name, index) => names.indexOf(name) !== index));
   const row: Row = {};
-  for (const column of columns) {
+  for (const column of plain) {
     const key =
       column.qualifier && duplicated.has(column.name) ? `${column.qualifier}.${column.name}` : column.name;
     const value = readColumn(scope, column.qualifier, column.name);
@@ -518,7 +620,10 @@ function holds(scope: Scope, predicate: Predicate): boolean {
   const left = readColumn(scope, predicate.qualifier, predicate.field);
   if (predicate.rightField) {
     const right = readColumn(scope, predicate.rightQualifier, predicate.rightField);
-    if (predicate.op === 'loose') return looseEqual(left, right ?? null);
+    // A missing value or `ubusa` does not equal another column, including another `ubusa`.
+    if (left === undefined || left === null || right === undefined || right === null) return false;
+    if (predicate.op === 'loose') return looseEqual(left, right);
+    if (predicate.op === 'eq') return left === right;
     return compare(left, predicate.op, typeof right === 'number' ? right : Number.NaN);
   }
   if (predicate.op === 'loose') return looseEqual(left, predicate.value ?? null);
@@ -546,4 +651,252 @@ function mergeRows(left: Row, right: Row, leftName: string, rightName: string): 
     row[key in left ? `${rightName}.${key}` : key] = cloneJson(value);
   }
   return row;
+}
+
+function needsShape(columns: '*' | SelectItem[], group?: ColumnRef[], order?: OrderKey[]): boolean {
+  if (group && group.length > 0) return true;
+  if (order && order.length > 0) return true;
+  return columns !== '*' && columns.some(isAggregate);
+}
+
+function isAggregate(item: SelectItem | AggregateRef | ColumnRef): item is AggregateRef {
+  return 'kind' in item && item.kind === 'aggregate';
+}
+
+function mentionedColumns(
+  where: Predicate[],
+  columns: '*' | SelectItem[],
+  group: ColumnRef[] | undefined,
+  order: OrderKey[] | undefined,
+): { qualifier?: string; field: string }[] {
+  const mentioned: { qualifier?: string; field: string }[] = [];
+  for (const predicate of where) mentioned.push(...referenced(predicate));
+  if (columns !== '*') {
+    for (const item of columns) {
+      if (isAggregate(item)) {
+        if (item.column !== '*') {
+          mentioned.push({ qualifier: item.column.qualifier, field: item.column.name });
+        }
+        continue;
+      }
+      mentioned.push({ qualifier: item.qualifier, field: item.name });
+    }
+  }
+  for (const key of group ?? []) mentioned.push({ qualifier: key.qualifier, field: key.name });
+  for (const key of order ?? []) {
+    if (isAggregate(key.item)) {
+      if (key.item.column !== '*') {
+        mentioned.push({ qualifier: key.item.column.qualifier, field: key.item.column.name });
+      }
+    } else {
+      mentioned.push({ qualifier: key.item.qualifier, field: key.item.name });
+    }
+  }
+  return mentioned;
+}
+
+function assertKnownColumns(
+  inputs: InputRelation[],
+  columns: { qualifier?: string; field: string }[],
+): void {
+  for (const column of columns) {
+    if (column.qualifier) {
+      const owner = inputs.find((input) => qualifierOf(input) === column.qualifier);
+      if (!owner) throw new KinDbError('E_TYPE', `Unknown table '${column.qualifier}'`);
+      if (!owner.columns.includes(column.field)) throw unknownColumn(column.field, owner.columns, qualifierOf(owner));
+      continue;
+    }
+    const declared = inputs.filter((input) => input.columns.length > 0);
+    if (declared.length === 0) throw unknownColumn(column.field, []);
+    const owners = declared.filter((input) => input.columns.includes(column.field));
+    if (owners.length === 1) continue;
+    if (owners.length > 1) throw new KinDbError('E_TYPE', `Column '${column.field}' is ambiguous`);
+    const known = [...new Set(declared.flatMap((input) => input.columns))];
+    throw unknownColumn(column.field, known);
+  }
+}
+
+function unknownColumn(field: string, columns: string[], table?: string): KinDbError {
+  const where = table ? ` on '${table}'` : '';
+  const list = columns.length > 0 ? columns.join(', ') : 'none yet';
+  const hint =
+    columns.length === 0
+      ? ` Declare it with kora itsinda, or insert a row that includes ${field}.`
+      : '';
+  return new KinDbError('E_TYPE', `Column '${field}' was not found${where}. Columns: ${list}.${hint}`);
+}
+
+function finishScopes(
+  scopes: Scope[],
+  columns: '*' | SelectItem[],
+  group: ColumnRef[] | undefined,
+  order: OrderKey[] | undefined,
+  limit: number | undefined,
+): Row[] {
+  const grouped = columns !== '*' && (columns.some(isAggregate) || Boolean(group && group.length > 0));
+  if (columns === '*' && group && group.length > 0) {
+    throw new KinDbError(
+      'E_TYPE',
+      'KORANYA needs named columns. Example: hitamo ishuri, bara(*) muri abanyeshuri koranya ishuri',
+    );
+  }
+  const rows = grouped
+    ? buildGroups(scopes, columns as SelectItem[], group ?? [])
+    : project(order && order.length ? sortScopes(scopes, order) : scopes, columns);
+  const ordered = grouped && order && order.length ? sortRows(rows, order) : rows;
+  return limit !== undefined ? ordered.slice(0, limit) : ordered;
+}
+
+function sortScopes(scopes: Scope[], order: OrderKey[]): Scope[] {
+  for (const key of order) {
+    if (isAggregate(key.item)) {
+      throw new KinDbError(
+        'E_TYPE',
+        'TONDEKA can sort BARA, TERANYA, NTO, or NINI after KORANYA. Example: hitamo ishuri, bara(*) muri abanyeshuri koranya ishuri tondeka bara(*) manuka',
+      );
+    }
+  }
+  return [...scopes].sort((left, right) => {
+    for (const key of order) {
+      if (isAggregate(key.item)) continue;
+      const cmp = directed(
+        readColumn(left, key.item.qualifier, key.item.name),
+        readColumn(right, key.item.qualifier, key.item.name),
+        key.direction,
+      );
+      if (cmp !== 0) return cmp;
+    }
+    return 0;
+  });
+}
+
+function sortRows(rows: Row[], order: OrderKey[]): Row[] {
+  return [...rows].sort((left, right) => {
+    for (const key of order) {
+      const name = isAggregate(key.item) ? aggregateName(key.item) : key.item.name;
+      const cmp = directed(left[name], right[name], key.direction);
+      if (cmp !== 0) return cmp;
+    }
+    return 0;
+  });
+}
+
+function directed(left: JsonValue | undefined, right: JsonValue | undefined, direction: 'asc' | 'desc'): number {
+  const cmp = orderValues(left, right);
+  if (cmp === 0) return 0;
+  const leftMissing = left === undefined || left === null;
+  const rightMissing = right === undefined || right === null;
+  if (leftMissing || rightMissing) return cmp;
+  return direction === 'desc' ? -cmp : cmp;
+}
+
+function buildGroups(scopes: Scope[], columns: SelectItem[], group: ColumnRef[]): Row[] {
+  const plain = columns.filter((item): item is ColumnRef => !isAggregate(item));
+  for (const column of plain) {
+    const listed = group.some((key) => key.name === column.name && key.qualifier === column.qualifier);
+    if (!listed) {
+      const label = column.qualifier ? `${column.qualifier}.${column.name}` : column.name;
+      throw new KinDbError(
+        'E_TYPE',
+        `Column '${label}' is not in KORANYA. Add it to KORANYA, or wrap it in BARA, TERANYA, NTO, or NINI.`,
+      );
+    }
+  }
+  if (scopes.length === 0) {
+    if (group.length === 0 && columns.some(isAggregate)) return [bucketRow(columns, [])];
+    return [];
+  }
+  const buckets = new Map<string, Scope[]>();
+  const order: string[] = [];
+  for (const scope of scopes) {
+    const id =
+      group.length === 0
+        ? ''
+        : group
+            .map((key) => JSON.stringify(readColumn(scope, key.qualifier, key.name) ?? null))
+            .join('\0');
+    const list = buckets.get(id);
+    if (list) list.push(scope);
+    else {
+      buckets.set(id, [scope]);
+      order.push(id);
+    }
+  }
+  return order.map((id) => bucketRow(columns, buckets.get(id) ?? []));
+}
+
+function bucketRow(columns: SelectItem[], rows: Scope[]): Row {
+  const row: Row = {};
+  const used = new Set<string>();
+  for (const item of columns) {
+    const name = isAggregate(item) ? aggregateName(item) : item.name;
+    if (used.has(name)) {
+      throw new KinDbError(
+        'E_TYPE',
+        `The result column '${name}' is used twice. Remove one, or group by different columns.`,
+      );
+    }
+    used.add(name);
+    row[name] = isAggregate(item) ? aggregateValue(item, rows) : groupedValue(item, rows);
+  }
+  return row;
+}
+
+function groupedValue(column: ColumnRef, rows: Scope[]): JsonValue {
+  if (rows.length === 0) return null;
+  const value = readColumn(rows[0], column.qualifier, column.name);
+  return value === undefined ? null : cloneJson(value);
+}
+
+function aggregateName(item: AggregateRef): string {
+  if (item.column === '*') return 'bara';
+  const prefix =
+    item.fn === 'count' ? 'bara' : item.fn === 'sum' ? 'teranya' : item.fn === 'min' ? 'nto' : 'nini';
+  return `${prefix}_${item.column.name}`;
+}
+
+function aggregateValue(item: AggregateRef, rows: Scope[]): JsonValue {
+  if (item.fn === 'count' && item.column === '*') return rows.length;
+  const column = item.column === '*' ? null : item.column;
+  if (!column) return rows.length;
+  if (item.fn === 'count') {
+    let count = 0;
+    for (const scope of rows) {
+      const value = readColumn(scope, column.qualifier, column.name);
+      if (value !== null && value !== undefined) count += 1;
+    }
+    return count;
+  }
+  let chosen: JsonValue | undefined;
+  let seen = false;
+  for (const scope of rows) {
+    const value = readColumn(scope, column.qualifier, column.name);
+    if (value === null || value === undefined) continue;
+    if (item.fn === 'sum') {
+      if (typeof value !== 'number') {
+        throw new KinDbError(
+          'E_TYPE',
+          `TERANYA needs numbers. Column '${column.name}' has a different value.`,
+        );
+      }
+      chosen = ((chosen as number) ?? 0) + value;
+      seen = true;
+      continue;
+    }
+    if (typeof value === 'object') {
+      throw new KinDbError(
+        'E_TYPE',
+        `NTO and NINI compare single values. Column '${column.name}' has an object.`,
+      );
+    }
+    if (!seen) {
+      chosen = value;
+      seen = true;
+      continue;
+    }
+    const cmp = orderValues(value, chosen);
+    if (item.fn === 'min' && cmp < 0) chosen = value;
+    if (item.fn === 'max' && cmp > 0) chosen = value;
+  }
+  return seen ? (chosen ?? null) : null;
 }

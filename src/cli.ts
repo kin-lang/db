@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
 import { Database } from './database';
 import { isKinDbError, KinDbError } from './errors';
 import type { ExecuteResult } from './execute';
 import { formatRows } from './format/table';
-import { Store } from './store';
 
 const HELP = `kindb — Kinyarwanda SQL for a small relational database
 
@@ -24,7 +23,7 @@ Options
   --no-create       Refuse to create a missing .db file
 
 A .kindb file is a list of statements: KORA ITSINDA, SHIRA, HINDURA,
-SIBA, SIBA BYOSE, HITAMO, HUZA. A .db file is 512-byte pages, starting
+SIBA, SIBA BYOSE, HITAMO, HUZA, TONDEKA, KORANYA. A .db file is 512-byte pages, starting
 with "KinDB page v1". An older JSON .db file, or a json-base document,
 still opens. The next save rewrites it as pages.
 
@@ -116,7 +115,7 @@ function init(filePath: string): number {
   if (existsSync(absolute)) {
     throw new KinDbError('E_IO', `Database file already exists: ${absolute}`);
   }
-  writeFileSync(absolute, Store.empty().toBytes());
+  Database.open(absolute, { create: true });
   process.stdout.write(`Created ${absolute}\n`);
   return 0;
 }

@@ -1,4 +1,5 @@
 import {
+  decodeNumberKey,
   encodeIndexKey,
   isNumberKey,
   rangeHigh,
@@ -41,6 +42,7 @@ export function planAccess(
   predicates: Predicate[],
   indexed: readonly string[],
   qualifier: string,
+  estimate?: (access: Access) => number,
 ): Access {
   let best: Access = { kind: 'scan' };
   for (const column of constantColumns(predicates, qualifier)) {
@@ -48,9 +50,16 @@ export function planAccess(
     if (constraint.unsat) return { kind: 'empty' };
     if (!indexed.includes(column)) continue;
     const access = toAccess(column, constraint);
-    if (access && rank(access) > rank(best)) best = access;
+    if (access && betterAccess(access, best, estimate)) best = access;
   }
   return best;
+}
+
+/** Bounds for one column, including when that column has no index. */
+export function accessForColumn(predicates: Predicate[], column: string, qualifier: string): Access {
+  const constraint = constrain(predicates, column, qualifier);
+  if (constraint.unsat) return { kind: 'empty' };
+  return toAccess(column, constraint) ?? { kind: 'scan' };
 }
 
 /** A read uses a point or a bounded range. An open range stays a table walk. */
@@ -109,6 +118,24 @@ function constrain(predicates: Predicate[], column: string, qualifier: string): 
     return result;
   }
   if (rangeUnsat(result)) result.unsat = true;
+  // `id >= 1 kandi id <= 1` is one value. A point lookup beats a wide range.
+  if (
+    !result.unsat &&
+    !result.point &&
+    result.low &&
+    result.high &&
+    result.low.inclusive &&
+    result.high.inclusive &&
+    result.low.value === result.high.value
+  ) {
+    const key = encodeIndexKey(result.low.value);
+    if (!key) {
+      result.unsat = true;
+      return result;
+    }
+    result.point = key;
+    result.pointValue = result.low.value;
+  }
   return result;
 }
 
@@ -194,4 +221,33 @@ function rank(access: Access): number {
   if (access.kind === 'range' && access.bothSides) return 2;
   if (access.kind === 'range') return 1;
   return 0;
+}
+
+/**
+ * A point beats a range when their sizes are unknown.
+ * When `estimate` can count entries, the smaller index wins: a duplicate
+ * point on every row must not hide a point that matches one row.
+ */
+function betterAccess(
+  next: Access,
+  current: Access,
+  estimate?: (access: Access) => number,
+): boolean {
+  if (estimate && next.kind !== 'scan' && current.kind !== 'scan') {
+    const nextCost = estimate(next);
+    const currentCost = estimate(current);
+    if (nextCost !== currentCost) return nextCost < currentCost;
+  }
+  const nextRank = rank(next);
+  const currentRank = rank(current);
+  if (nextRank !== currentRank) return nextRank > currentRank;
+  return span(next) < span(current);
+}
+
+function span(access: Access): number {
+  if (access.kind !== 'range' || !access.low || !access.high) return Number.POSITIVE_INFINITY;
+  const low = decodeNumberKey(access.low.key);
+  const high = decodeNumberKey(access.high.key);
+  if (low === null || high === null) return Number.POSITIVE_INFINITY;
+  return Math.max(0, high - low);
 }

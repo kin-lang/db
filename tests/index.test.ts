@@ -514,4 +514,61 @@ describe('simple indexes', () => {
     expect(db.query(sql)).toEqual(full);
     expect(db.query(`${sql} imipaka 2`)).toEqual(full.slice(0, 2));
   });
+
+  test('a limited range keeps stored order across splits, deletes, rollback, and reopen', () => {
+    const file = path.join(tempDir(), 'order.db');
+    const db = Database.open(file, { create: true });
+    db.execute('kora itsinda t (id umubare); kora urutonde t_id muri t (id)');
+    const live: number[] = [];
+    db.transaction(() => {
+      for (let step = 0; step < 300; step += 1) {
+        const id = (step * 17) % 90;
+        db.add({ collection: 't', data: { id } });
+        live.push(id);
+      }
+    });
+    const expectRows = (low: number, high: number | null, limit: number): void => {
+      const want = live
+        .filter((id) => id >= low && (high === null || id <= high))
+        .slice(0, limit)
+        .map((id) => ({ id }));
+      const sql =
+        high === null
+          ? `hitamo id muri t aho id >= ${low} imipaka ${limit}`
+          : `hitamo id muri t aho id >= ${low} kandi id <= ${high} imipaka ${limit}`;
+      expect(db.query(sql)).toEqual(want);
+    };
+    expectRows(10, null, 1);
+    expectRows(10, null, 5);
+    expectRows(0, 40, 3);
+    const before = db.indexVisits;
+    expectRows(10, null, 1);
+    expect(db.indexVisits - before).toBeLessThan(40);
+
+    if (live.includes(10)) {
+      db.del({ collection: 't', where: { id: 10 } });
+      for (let i = live.length - 1; i >= 0; i -= 1) {
+        if (live[i] === 10) live.splice(i, 1);
+      }
+    }
+    expectRows(10, null, 3);
+
+    expect(() => {
+      db.transaction(() => {
+        db.add({ collection: 't', data: { id: 5 } });
+        db.del({ collection: 't', where: { id: live[0] } });
+        throw new Error('rollback');
+      });
+    }).toThrow(/rollback/);
+    expectRows(0, null, 4);
+
+    const again = Database.open(file);
+    const want = live
+      .filter((id) => id >= 10)
+      .slice(0, 2)
+      .map((id) => ({ id }));
+    const seen = again.indexVisits;
+    expect(again.query('hitamo id muri t aho id >= 10 imipaka 2')).toEqual(want);
+    expect(again.indexVisits - seen).toBeLessThan(40);
+  });
 });

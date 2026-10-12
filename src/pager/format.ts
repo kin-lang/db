@@ -83,6 +83,59 @@ export function writeHeader(page: Buffer, header: FileHeader): void {
   page.writeUInt32BE(header.schemaNext, 44);
 }
 
+/**
+ * Page 1 bytes 48..55. Version 0 means an older file with no checksum.
+ * The value is the XOR of every page digest. Page 1 is digested with
+ * these bytes zeroed, so stamping the value does not change its digest.
+ */
+const CHECKSUM_VERSION_AT = 48;
+const CHECKSUM_VALUE_AT = 52;
+const CHECKSUM_VERSION = 1;
+
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n += 1) {
+  let crc = n;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  CRC_TABLE[n] = crc >>> 0;
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** Digest of one page. Header page 1 ignores the checksum field. */
+export function pageDigest(page: Buffer, header: boolean): number {
+  if (!header) return crc32(page);
+  const copy = Buffer.from(page);
+  copy.fill(0, CHECKSUM_VERSION_AT, CHECKSUM_VALUE_AT + 4);
+  return crc32(copy);
+}
+
+export function checksumOf(digests: readonly number[]): number {
+  let xor = 0;
+  for (const digest of digests) xor = (xor ^ digest) >>> 0;
+  return xor;
+}
+
+/** Null when this file was written before checksums existed. */
+export function readStoredChecksum(page: Buffer): number | null {
+  if (page.length < CHECKSUM_VALUE_AT + 4 || page.readUInt8(CHECKSUM_VERSION_AT) !== CHECKSUM_VERSION) {
+    return null;
+  }
+  return page.readUInt32BE(CHECKSUM_VALUE_AT);
+}
+
+export function stampChecksum(page: Buffer, xor: number): void {
+  page.writeUInt8(CHECKSUM_VERSION, CHECKSUM_VERSION_AT);
+  page.writeUInt32BE(xor >>> 0, CHECKSUM_VALUE_AT);
+}
+
 export function blankLeaf(): Buffer {
   const page = Buffer.alloc(PAGE_SIZE);
   page.writeUInt8(PAGE_LEAF, 0);

@@ -63,6 +63,8 @@ describe('orm', () => {
       f: 'ukuri',
       g: 'any',
       h: 'ikintu',
+      i: 'Umubare',
+      j: 'NUMBER',
     });
     expect(defined.collection).toBe('abanyeshuri');
     expect(defined.columns).toEqual([
@@ -74,6 +76,8 @@ describe('orm', () => {
       { name: 'f', type: 'boolean' },
       { name: 'g', type: 'any' },
       { name: 'h', type: 'any' },
+      { name: 'i', type: 'number' },
+      { name: 'j', type: 'number' },
     ]);
   });
 

@@ -8,19 +8,26 @@ export interface ColumnDef {
   type: ColumnType;
 }
 
-const TYPE_NAMES: Record<string, ColumnType> = {
+/** Kinyarwanda names and the English names used by the ORM. Both spell the same four types. */
+export const COLUMN_TYPES = {
   umubare: 'number',
+  number: 'number',
   ijambo: 'string',
+  string: 'string',
   ukuri: 'boolean',
+  boolean: 'boolean',
   ikintu: 'any',
-};
+  any: 'any',
+} as const;
+
+export type FieldKind = keyof typeof COLUMN_TYPES;
 
 export function columnTypeFromName(name: string): ColumnType {
-  const type = TYPE_NAMES[name];
+  const type = COLUMN_TYPES[name.toLowerCase() as FieldKind];
   if (!type) {
     throw new KinDbError(
       'E_TYPE',
-      `Column type '${name}' is not umubare, ijambo, ukuri, or ikintu`,
+      `Column type '${name}' is not umubare, ijambo, ukuri, or ikintu (number, string, boolean, or any)`,
     );
   }
   return type;

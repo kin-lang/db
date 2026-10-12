@@ -8,6 +8,8 @@ export { tokenize } from './lexer/lexer';
 export type { Token, TokenType } from './lexer/tokens';
 export { KINDB_VERSION, Store } from './store';
 export type { ColumnDef, ColumnType } from './pager/record';
+export { sqlLiteral, sqlName } from './sql';
+export type { SqlParams } from './sql';
 export type { Statement } from './parser/ast';
 export type {
   CompareOp,

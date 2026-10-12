@@ -40,6 +40,7 @@ export type TokenType =
   | 'nibyo'
   | 'sibyo'
   | 'ubusa'
+  | 'param'
   | 'eof';
 
 export interface Token {

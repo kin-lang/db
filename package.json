@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "exports": {
@@ -32,6 +33,8 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest --no-watch",
+    "explain-types": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/explain-types.ts",
+    "release": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/release.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

@@ -27,5 +27,8 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Explain types
+        run: npm run explain-types
+
       - name: Test
         run: npm test

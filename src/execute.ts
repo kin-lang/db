@@ -94,10 +94,30 @@ export function executeStatements(statements: Statement[], store: Store): Execut
               high: Bound | null,
               visit: (row: Row, rowid: number) => boolean,
             ) => store.scanRange(ref.name, column, low, high, visit),
+            read: (predicates, limit, visit) =>
+              store.read(
+                ref.name,
+                predicates,
+                limit,
+                (row, rowid) => visit(row, rowid),
+                ref.alias ?? ref.name,
+              ),
+            readOrdered: (predicates, column, direction, limit, visit) =>
+              store.readOrdered(
+                ref.name,
+                predicates,
+                column,
+                direction,
+                limit,
+                (row) => visit(row),
+                ref.alias ?? ref.name,
+              ),
           })),
           statement.where,
           statement.columns,
           statement.limit,
+          statement.group,
+          statement.order,
         );
         result.rows.push(rows);
         result.last = { kind: 'select', rows };
